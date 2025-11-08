@@ -1,19 +1,26 @@
-// index.js
 import "dotenv/config";
 import { TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions/index.js";
 import { Api } from "telegram/index.js";
 import { NewMessage } from "telegram/events/index.js";
 
+// --- ENV ---
 const apiId = Number(process.env.API_ID);
 const apiHash = process.env.API_HASH;
 const stringSession = new StringSession(process.env.SESSION || "");
-const joinTarget = process.env.JOIN_TARGET;
-const outboundChat = process.env.TELEGRAM_CHAT_ID || ""; // может быть @username или -100...
+const joinTarget = process.env.JOIN_TARGET; // @username или https://t.me/+hash
+const outboundChat = process.env.TELEGRAM_CHAT_ID || ""; // @username или -100...
 
-// ---------- helpers ----------
+// --- helpers ---
+function sanitize(text = "") {
+  return text
+    .replace(/https?:\/\/\S+/g, "") // убрать URL
+    .replace(/[\u200B-\u200D\uFEFF]/g, "") // zero-width/BOM
+    .replace(/[\u00A0\u202F\u2009]/g, " ") // NBSP/узкие пробелы -> пробел
+    .normalize("NFKC");
+}
 function getText(m) {
-  return (m?.message || "").trim();
+  return sanitize(m?.message || "");
 }
 function getHeaderLine(text) {
   const lines = text
@@ -22,14 +29,27 @@ function getHeaderLine(text) {
     .filter(Boolean);
   return lines[0] || "";
 }
-function hasNewTrendingHeader(text) {
-  return /new\s+trending/i.test(getHeaderLine(text));
+function hasNewTrending(text) {
+  const lines = text
+    .split("\n")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const head2 = (lines[0] || "") + " | " + (lines[1] || "");
+  return /new\s+trending/i.test(head2);
 }
-function extractTicker(text) {
-  const m = text.match(/\$[A-Z0-9]{2,12}\b/); // под твой формат $PEANUT
+function extractTickerFromDev(text) {
+  const lines = text.split("\n");
+  const devLine = lines.find((l) => /(^|[\s\W])dev\s*[:：]/i.test(l));
+  if (!devLine) return null;
+
+  // Берём первый $TICKER из ЭТОЙ строки (2–12 символов, буква сначала)
+  const m = devLine.match(/\$[A-Z][A-Z0-9]{1,11}\b/);
   return m ? m[0] : null;
 }
-
+function extractTicker(text) {
+  const m = text.match(/\$[A-Z0-9]{2,12}\b/);
+  return m ? m[0] : null;
+}
 function parseTMeLink(raw) {
   const s = String(raw || "").trim();
   if (!s) return null;
@@ -43,7 +63,6 @@ function parseTMeLink(raw) {
   if (/^[A-Za-z0-9_]{5,}$/.test(s)) return { type: "username", value: s };
   return null;
 }
-
 async function joinTargetChat(client, target) {
   const parsed = parseTMeLink(target);
   if (!parsed) return;
@@ -55,8 +74,6 @@ async function joinTargetChat(client, target) {
     new Api.messages.ImportChatInvite({ hash: parsed.value })
   );
 }
-
-// Попробуем получить ссылку на сообщение (работает для каналов/супергрупп с публичным @)
 async function tryExportMsgLink(client, chat, msgId) {
   try {
     const res = await client.invoke(
@@ -69,22 +86,19 @@ async function tryExportMsgLink(client, chat, msgId) {
     );
     return res?.link || null;
   } catch {
-    return null; // приватный чат/нет прав/нет username — просто молча пропустим
+    return null;
   }
 }
-
-// Универсальная отправка в чат из .env (поддерживает @username и числовой id)
 async function sendOutbound(client, text) {
   if (!outboundChat) return;
   const target = outboundChat.startsWith("@")
     ? outboundChat
     : outboundChat.match(/^-?\d+$/)
     ? BigInt(outboundChat)
-    : outboundChat; // -100... → BigInt
+    : outboundChat;
   await client.sendMessage(target, { message: text });
 }
 
-// ---------- main ----------
 async function main() {
   const client = new TelegramClient(stringSession, apiId, apiHash, {
     connectionRetries: 5,
@@ -94,60 +108,74 @@ async function main() {
     password: () => Promise.resolve(process.env.PASSWORD || ""),
     phoneCode: async () => {
       throw new Error(
-        "Первый запуск сделай интерактивно, чтобы получить SESSION; потом положи его в .env"
+        "Первый вход сделай интерактивно, получи SESSION и сохрани его в .env"
       );
     },
     onError: (e) => console.error(e),
   });
 
   console.log(
-    "Успешный вход. SESSION:\n",
+    "SESSION:\n",
     client.session.save(),
-    "\n— Сохрани эту строку в .env как SESSION."
+    "\n— положи в .env как SESSION."
   );
 
   if (joinTarget) {
     try {
       await joinTargetChat(client, joinTarget);
     } catch (e) {
-      console.error("Не удалось присоединиться:", e.message);
+      console.error("Join error:", e.message);
     }
   }
 
+  // (Необязательно) прогреть кэш диалогов — помогает event.getChat()
+  await client.getDialogs({}).catch(() => {});
+
+  // --- Надёжный слушатель ---
   client.addEventHandler(async (event) => {
     try {
-      const chat = await event.getChat();
-      if (!/Chat|Channel/.test(chat?.className || "")) return;
+      const msg = event.message;
+      if (!msg) return;
 
-      const txt = getText(event.message);
+      // Резолвим чат без зависимости от кэша:
+      const inputPeer = await client.getInputEntity(msg.peerId);
+      const chat = await client.getEntity(inputPeer);
+      if (!/Chat|Channel/.test(chat.className || "")) return; // только группы/каналы
+
+      const txt = getText(msg);
       if (!txt) return;
+      if (!hasNewTrending(txt)) return;
 
-      if (!hasNewTrendingHeader(txt)) return;
-
-      const ticker = extractTicker(txt);
+      const ticker = extractTickerFromDev(txt);
+      console.log("ticker", ticker);
       if (!ticker) return;
 
       const header = getHeaderLine(txt);
-      const link = await tryExportMsgLink(client, chat, event.message.id);
+      const link = await tryExportMsgLink(client, chat, msg.id);
 
-      // лог в консоль
+      // лог
       console.log(`[${new Date().toISOString()}] NewTrending`, {
-        chatTitle: chat?.title,
+        chatTitle: chat.title,
         chatId: String(event.chatId),
-        msgId: event.message.id,
+        msgId: msg.id,
+        header,
         ticker,
       });
 
-      // отправка в чат из .env
-      const outboundText =
-        `🔥 New Trending\n` +
-        `• Chat: ${chat?.title || ""}\n` +
-        `• Ticker: ${ticker}\n` +
+      // отправка результата в целевой чат
+      const out =
+        `🔥 *New Trending*\n` +
+        `• Chat: ${chat.title}\n` +
+        `• Header: ${header}\n` +
+        `• Ticker: \`${ticker}\`\n` +
         (link ? `• Link: ${link}\n` : "") +
-        `• MsgID: ${event.message.id}`;
-      await sendOutbound(client, outboundText);
-    } catch (err) {
-      console.error("Handler error:", err.message);
+        `• MsgID: ${msg.id}`;
+      await client.sendMessage(
+        outboundChat.startsWith("@") ? outboundChat : BigInt(outboundChat),
+        { message: out, parseMode: "Markdown" }
+      );
+    } catch (e) {
+      console.error("Handler error:", e.message);
     }
   }, new NewMessage({}));
 
