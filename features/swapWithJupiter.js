@@ -1,50 +1,132 @@
-// swapOneSolToCoinLiteral.js
-import { Connection, Keypair, VersionedTransaction } from "@solana/web3.js";
+// ESM: "type": "module" в package.json
 import axios from "axios";
 import https from "node:https";
 import bs58 from "bs58";
 import { setDefaultResultOrder } from "node:dns";
+import { Connection, Keypair, VersionedTransaction } from "@solana/web3.js";
+
 setDefaultResultOrder?.("ipv4first");
 
-const AX = axios.create({
-  // форс IPv4 и без keepAlive (некоторым сетям CF так нравится больше)
-  httpsAgent: new https.Agent({ family: 4, keepAlive: false }),
-  timeout: 15000,
-  headers: {
-    accept: "application/json",
-    "user-agent": "riichard-swap-bot/1.0",
-    origin: "https://jup.ag",
-    referer: "https://jup.ag/",
-  },
-});
-
-// ---------- константы ----------
-const WSOL_MINT = "So11111111111111111111111111111111111111112";
-const SOL_DEC = 9;
-
-const JUP_HEADERS = {
+// -----------------------------
+// Константы / заголовки
+// -----------------------------
+const COMMON_HEADERS = {
   accept: "application/json",
   "user-agent": "riichard-swap-bot/1.0",
   origin: "https://jup.ag",
   referer: "https://jup.ag/",
 };
 
-// ---------- утилиты ----------
+async function resolveMintBySymbol(symbol) {
+  const query = symbol.trim().toUpperCase(); // "USDT"
+  const list = await jupSearchSymbol(query); // твоя функция на lite-api.jup.ag
+  const want = list.filter((t) => (t.symbol || "").toUpperCase() === query);
+  if (!want.length) throw new Error(`No token found for ${symbol}`);
+
+  // предпочитаем verified и основной токен-программы (не token-2022)
+  want.sort(
+    (a, b) =>
+      Number(!!b.verified) - Number(!!a.verified) ||
+      Number((b.tokenProgram || "") === "spl-token") -
+        Number((a.tokenProgram || "") === "spl-token")
+  );
+
+  const picked = want[0]; // { id, symbol, decimals, verified, tokenProgram, ... }
+  return { mint: picked.id, dec: picked.decimals, meta: picked };
+}
+
+// -----------------------------
+// HTTP клиенты (Jupiter v6 и Tokens v2)
+// -----------------------------
+function createJupClient({ host = "quote-api.jup.ag", ip }) {
+  if (ip) {
+    return axios.create({
+      baseURL: `https://${ip}`,
+      httpsAgent: new https.Agent({
+        family: 4,
+        keepAlive: false,
+        servername: host,
+      }),
+      headers: { ...COMMON_HEADERS, host }, // Host header обязателен при работе по IP
+      timeout: 15000,
+    });
+  }
+  return axios.create({
+    baseURL: `https://${host}`,
+    httpsAgent: new https.Agent({ family: 4, keepAlive: false }),
+    headers: { ...COMMON_HEADERS },
+    timeout: 15000,
+  });
+}
+
+// Tokens v2 (обычно резолвится нормально; при желании можно сделать IP-аналог)
+const TOKENS_AX = axios.create({
+  baseURL: "https://lite-api.jup.ag",
+  httpsAgent: new https.Agent({ family: 4, keepAlive: false }),
+  headers: { ...COMMON_HEADERS },
+  timeout: 15000,
+});
+
+// -----------------------------
+// Утилиты
+// -----------------------------
 function normalizeLiteral(lit) {
   return String(lit || "")
     .replace(/^\$/, "")
     .trim(); // "$BONK" -> "BONK"
 }
+
+async function buildSignSendSwap({
+  jax,
+  q,
+  conn,
+  wallet,
+  priorityMaxLamports = 200_000,
+}) {
+  // 1) Сборка транзакции на стороне Jupiter
+  const { data } = await jax.post("/v6/swap", {
+    quoteResponse: q, // ← передаём ВЕСЬ объект котировки
+    userPublicKey: wallet.publicKey.toBase58(),
+    asLegacyTransaction: false,
+    prioritizationFeeLamports: {
+      priorityLevelWithMaxLamports: {
+        priorityLevel: "high", // "low" | "medium" | "high" | "veryHigh" | "extreme"
+        maxLamports: 200_000,
+      },
+    },
+  });
+
+  const { swapTransaction } = data; // base64
+  if (!swapTransaction)
+    throw new Error("No swapTransaction in Jupiter response");
+
+  // 2) Подписать и отправить с твоего кошелька
+  const tx = VersionedTransaction.deserialize(
+    Buffer.from(swapTransaction, "base64")
+  );
+  tx.sign([wallet]);
+
+  const sig = await conn.sendRawTransaction(tx.serialize(), {
+    skipPreflight: false,
+    maxRetries: 3,
+  });
+
+  const conf = await conn.confirmTransaction(sig, "confirmed");
+  if (conf.value?.err) {
+    throw new Error(`Tx failed: https://solscan.io/tx/${sig}`);
+  }
+  return sig;
+}
+
 function toRawAmount(ui, decimals) {
-  if (!Number.isFinite(ui) || ui <= 0) throw new Error("Invalid amount UI");
+  if (!Number.isFinite(ui) || ui <= 0) throw new Error("Invalid UI amount");
   return BigInt(Math.round(ui * 10 ** decimals)).toString();
 }
 
-// кошелёк: принимает base58 ИЛИ JSON-массив байт
 function keypairFromAny(secret) {
   const s = typeof secret === "string" ? secret.trim() : JSON.stringify(secret);
 
-  // JSON-массив
+  // JSON-массив байт
   if (s.startsWith("[")) {
     const arr = JSON.parse(s);
     const bytes = Uint8Array.from(arr);
@@ -52,6 +134,7 @@ function keypairFromAny(secret) {
     if (bytes.length === 32) return Keypair.fromSeed(bytes);
     throw new Error(`Unexpected byte array length=${bytes.length}`);
   }
+
   // base58
   if (/^[1-9A-HJ-NP-Za-km-z]+$/.test(s)) {
     const bytes = bs58.decode(s);
@@ -59,7 +142,8 @@ function keypairFromAny(secret) {
     if (bytes.length === 32) return Keypair.fromSeed(bytes);
     throw new Error(`Unexpected base58 length=${bytes.length}`);
   }
-  // hex (на всякий)
+
+  // hex
   if (/^[0-9a-fA-F]+$/.test(s)) {
     const bytes = new Uint8Array(
       s.match(/.{1,2}/g).map((h) => parseInt(h, 16))
@@ -68,167 +152,93 @@ function keypairFromAny(secret) {
     if (bytes.length === 32) return Keypair.fromSeed(bytes);
     throw new Error(`Unexpected hex length=${bytes.length}`);
   }
+
   throw new Error("Unsupported WALLET_SECRET_KEY format");
 }
 
-// Jupiter Tokens API v2
-async function jupSearch(query) {
-  const url = `https://lite-api.jup.ag/tokens/v2/search?query=${encodeURIComponent(
-    query
-  )}`;
-  const res = await AX.get(url);
-  return res.data;
+// -----------------------------
+// Tokens API v2
+// -----------------------------
+async function jupSearchSymbol(symbol) {
+  const { data } = await TOKENS_AX.get("/tokens/v2/search", {
+    params: { query: symbol },
+  });
+  return data;
 }
+// -----------------------------
+// Jupiter v6 (через IP/SNI при необходимости)
+// -----------------------------
 
-// --- новый getJupQuote на axios + fallback ---
-async function getJupQuote(qUrl) {
-  // 1) основной
-  try {
-    const res = await AX.get(qUrl.toString());
-    return res.data;
-  } catch (e) {
-    // если не 401/403 — пробрасываем дальше
-    const status = e?.response?.status;
-    if (status !== 401 && status !== 403) throw e;
-
-    // 2) fallback-домен
-    try {
-      const alt = new URL("https://quote-api.jup.ag/v6/quote");
-      for (const [k, v] of qUrl.searchParams.entries())
-        alt.searchParams.set(k, v);
-      const res2 = await AX.get(alt.toString());
-      return res2.data;
-    } catch (e2) {
-      throw e2; // если DNS не резолвит quote-api.jup.ag — увидим явную ошибку
-    }
-  }
-}
-// точное совпадение по символу, приоритет verified
-function pickExactSymbol(results, wantSym) {
+function pickExactSymbolPreferVerified(results, wantSym) {
   const want = wantSym.toUpperCase();
   const exact = (results || []).filter(
     (t) => (t.symbol || "").toUpperCase() === want
   );
   if (!exact.length) throw new Error(`No exact symbol match for "${wantSym}".`);
-  exact.sort((a, b) => Number(!!b.verified) - Number(!!a.verified));
+  // только verified сначала
+  const verified = exact.filter((t) => !!t.verified);
+  if (verified.length) return verified[0];
+  // иначе берём с наибольшей ликвидностью/объёмом если есть такое поле, иначе первый
+  exact.sort((a, b) => (b.liquidity ?? 0) - (a.liquidity ?? 0));
   return exact[0];
 }
 
-// ---------- Jupiter V6: quote + build с заголовками и fallback ----------
-// async function getJupQuote(qUrl) {
-//   // основной хост
-//   let res;
-//   try {
-//     res = await fetch(qUrl, { headers: JUP_HEADERS });
-//   } catch (e) {
-//     res = { ok: false, status: 0, _neterr: e };
-//   }
-
-//   // при 401/403/сетевой ошибке пробуем fallback
-//   if (res.status === 401 || res.status === 403 || res.ok === false) {
-//     try {
-//       const alt = new URL("https://quote-api.jup.ag/v6/quote");
-//       for (const [k, v] of qUrl.searchParams.entries())
-//         alt.searchParams.set(k, v);
-//       res = await fetch(alt, { headers: JUP_HEADERS });
-//     } catch (e2) {
-//       if (res._neterr) throw res._neterr;
-//       // если DNS не резолвит fallback — отдадим исходную ошибку
-//     }
-//   }
-
-//   if (!res.ok) {
-//     const body = await res.text().catch(() => "");
-//     throw new Error(`/quote failed: ${res.status} ${body}`);
-//   }
-//   return res.json();
-// }
-
-async function buildJupSwap(route, userPub, jupBase, priorityMaxLamports) {
-  const body = {
-    quoteResponse: route,
-    userPublicKey: userPub,
-    asLegacyTransaction: false,
-    prioritizationFeeLamports: {
-      priorityLevelWithMaxLamports: { maxLamports: priorityMaxLamports },
-    },
-  };
-
-  try {
-    const res = await AX.post(`${jupBase}/swap/v1/swap`, body);
-    return res.data;
-  } catch (e) {
-    const status = e?.response?.status;
-    if (status !== 401 && status !== 403) throw e;
-
-    const res2 = await AX.post("https://quote-api.jup.ag/v6/swap", body);
-    return res2.data;
-  }
-}
-
-// ---------- основной экспорт ----------
+// -----------------------------
+// Основная функция
+// -----------------------------
 /**
- * Свапает 1 SOL -> токен по литералу (напр. "$BONK")
+ * Свап 1 SOL -> токен по литералу (например "$BONK"), Jupiter v6
  * @param {Object} env
- * @param {string} env.rpcUrl
- * @param {string|number[]} env.walletSecretKey  base58 ИЛИ JSON-массив байт
- * @param {string} [env.jupBase]                 default "https://api.jup.ag"
- * @param {number} [env.slippageBps]             default 50
- * @param {number} [env.priorityMaxLamports]     default 200_000
- * @param {string} coinLiteral                   "$BONK" | "BONK"
- * @returns {Promise<string>} signature
+ * @param {string} env.rpcUrl                    - Solana mainnet RPC
+ * @param {string|number[]} env.walletSecretKey - base58 или JSON-массив байт
+ * @param {number} [env.slippageBps=50]
+ * @param {number} [env.priorityMaxLamports=200_000]
+ * @param {string} [env.jupHost="quote-api.jup.ag"]
+ * @param {string} [env.jupIp]                   - если указан, используем IP + SNI (обход DNS)
+ * @param {string} coinLiteral                   - "$BONK" | "BONK"
+ * @returns {Promise<string>} подпись транзакции
  */
-export async function swapOneSolToCoinLiteral(env, coinLiteral) {
-  const jupBase = env.jupBase || "https://api.jup.ag";
+export async function swapOneSolToCoinLiteral(env, coinLiteral, amountC) {
   const slippageBps = env.slippageBps ?? 50;
-  const priorityMaxLamports = env.priorityMaxLamports ?? 200_000;
+  const priorityMaxLamports = env.priorityMaxLamports ?? 1_000;
 
-  // RPC/кошелёк
   const conn = new Connection(env.rpcUrl, { commitment: "confirmed" });
   const wallet = keypairFromAny(env.walletSecretKey);
 
-  // 1) mint по символу
-  const outSym = normalizeLiteral(coinLiteral); // "$BONK" -> "BONK"
-  const list = await jupSearch(outSym);
-  const chosen = pickExactSymbol(list, outSym);
-  const outputMint = chosen.id;
-
-  // 2) quote (1 SOL)
-  const amount = toRawAmount(1, SOL_DEC); // "1000000000"
-  const q = new URL("https://api.jup.ag/swap/v1/quote");
-  q.searchParams.set("inputMint", WSOL_MINT);
-  q.searchParams.set("outputMint", outputMint);
-  q.searchParams.set("amount", amount);
-  q.searchParams.set("slippageBps", String(slippageBps));
-
-  const quote = await getJupQuote(q);
-  const route = quote?.routes?.[0];
-  if (!route)
-    throw new Error(
-      "No route found for 1 SOL. Try higher slippage or another token."
-    );
-
-  // 3) build swap tx
-  const { swapTransaction } = await buildJupSwap(
-    route,
-    wallet.publicKey.toBase58(),
-    jupBase,
-    priorityMaxLamports
-  );
-
-  // 4) sign & send
-  const tx = VersionedTransaction.deserialize(
-    Buffer.from(swapTransaction, "base64")
-  );
-  tx.sign([wallet]);
-  const sig = await conn.sendRawTransaction(tx.serialize(), {
-    skipPreflight: false,
-    maxRetries: 3,
+  // HTTP клиент для Jupiter v6
+  const JAX = createJupClient({
+    host: env.jupHost || "quote-api.jup.ag",
+    ip: env.jupIp,
   });
 
-  // 5) confirm
-  const conf = await conn.confirmTransaction(sig, "confirmed");
-  if (conf.value?.err)
-    throw new Error(`Transaction error. See: https://solscan.io/tx/${sig}`);
-  return sig;
+  // 1) mint по символу
+  const outSym = normalizeLiteral(coinLiteral); // "$BONK" -> "BONK"
+  const list = await jupSearchSymbol(outSym);
+  let chosen = pickExactSymbolPreferVerified(list, outSym);
+  let outputMint = chosen.id;
+  const inToken = await resolveMintBySymbol("USDT"); // ← резолвим USDT
+  const uiAmount = amountC; // ← 10 USDT
+  const amount = toRawAmount(uiAmount, inToken.dec); // 10 * 10^6 -> "10000000"
+
+  const params = {
+    inputMint: inToken.mint, // ← теперь USDT mint
+    outputMint, // как раньше (mint целевой монеты по твоему литералу)
+    amount, // "10000000"
+    slippageBps, // как было (например, 50)
+    swapMode: "ExactIn",
+  };
+
+  const { data: quoteRaw } = await JAX.get("/v6/quote", { params });
+
+  const sig = await buildSignSendSwap({
+    jax: JAX, // твой axios-клиент к Jupiter (с IP+SNI, который уже работает)
+    q: quoteRaw, // ПЕРЕДАВАЙ ВЕСЬ ОБЪЕКТ QUOTE из твоего лога
+    conn, // Connection к RPC
+    wallet, // Keypair (из base58/JSON)
+    priorityMaxLamports, // опционально
+  });
+
+  console.log("SIG", sig);
+
+  console.log("✅ Swap tx:", `https://solscan.io/tx/${sig}`);
 }
