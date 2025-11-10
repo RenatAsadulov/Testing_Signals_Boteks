@@ -34,16 +34,16 @@ function makeKeyboard(settings) {
 }
 
 bot.start(async (ctx) => {
-  await ctx.reply("Привет! Я настраиваю *token* и *amount*.", {
+  await ctx.reply("Hello! Here you can config *token* и *amount*.", {
     parse_mode: "Markdown",
   });
   const s = await store.getAll();
-  await ctx.reply("Текущие значения:", makeKeyboard(s));
+  await ctx.reply("Current values:", makeKeyboard(s));
 });
 
 bot.command("settings", async (ctx) => {
   const s = await store.getAll();
-  await ctx.reply("Текущие значения:", makeKeyboard(s));
+  await ctx.reply("Current values:", makeKeyboard(s));
 });
 
 bot.command("get", async (ctx) => {
@@ -58,20 +58,19 @@ bot.command("set", async (ctx) => {
     // assertOwner(ctx);
     const [, key, ...rest] = (ctx.message.text || "").split(/\s+/);
     const value = rest.join(" ");
-    if (!key || !value)
-      return ctx.reply("Использование: /set <token|amount> <value>");
+    if (!key || !value) return ctx.reply("Use: /set <token|amount> <value>");
     if (key === "token") {
       await store.setToken(value);
     } else if (key === "amount") {
       const n = Number(value);
-      if (!Number.isFinite(n)) return ctx.reply("amount должен быть числом");
+      if (!Number.isFinite(n)) return ctx.reply("amount should be a number");
       await store.setAmount(n);
     } else {
-      return ctx.reply("Допустимые ключи: token, amount");
+      return ctx.reply("Available keys: token, amount");
     }
     const s = await store.getAll();
-    await ctx.reply("Сохранено ✅");
-    await ctx.reply("Текущие значения:", makeKeyboard(s));
+    await ctx.reply("Saved ✅");
+    await ctx.reply("Current values:", makeKeyboard(s));
   } catch (e) {
     await ctx.reply("Ошибка: " + e.message);
   }
@@ -93,12 +92,12 @@ bot.on("callback_query", async (ctx) => {
     ctx.session ??= {};
     ctx.session.editKey = key;
     await ctx.answerCbQuery();
-    await ctx.reply(`Введите значение для \`${key}\`:`, {
+    await ctx.reply(`Insert value for \`${key}\`:`, {
       parse_mode: "Markdown",
     });
   } catch (e) {
     await ctx.answerCbQuery().catch(() => {});
-    await ctx.reply("Ошибка: " + e.message);
+    await ctx.reply("Error: " + e.message);
   }
 });
 
@@ -116,12 +115,10 @@ bot.on("message", async (ctx, next) => {
     }
     ctx.session.editKey = null;
     const s = await store.getAll();
-    await ctx.reply("Сохранено ✅");
-    await ctx.reply("Текущие значения:", makeKeyboard(s));
+    await ctx.reply("Saved ✅");
+    await ctx.reply("Current values:", makeKeyboard(s));
   } catch (e) {
-    await ctx.reply(
-      "Ошибка: " + e.message + "\nПопробуйте еще раз или /settings"
-    );
+    await ctx.reply("Error: " + e.message + "\n Try again or use /settings");
   }
 });
 
@@ -132,7 +129,7 @@ bot.use(async (ctx, next) => {
 
 bot.catch((err, ctx) => {
   console.error("Bot error:", err);
-  ctx.reply("Непредвиденная ошибка: " + err.message).catch(() => {});
+  ctx.reply("Unexpected error: " + err.message).catch(() => {});
 });
 
 bot.launch();
