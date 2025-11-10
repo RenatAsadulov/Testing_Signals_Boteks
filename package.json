@@ -4,7 +4,7 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "start": "node index.js"
+    "start": "nodemon --exec \"node --env-file=.env\" index.js"
   },
   "author": "",
   "license": "ISC",
@@ -18,5 +18,8 @@
     "input": "^1.0.1",
     "telegraf": "^4.16.3",
     "telegram": "^2.26.22"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.10"
   }
 }

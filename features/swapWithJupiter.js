@@ -208,6 +208,7 @@ function pickExactSymbolPreferVerified(results, wantSym) {
  * @returns {Promise<string>} подпись транзакции
  */
 export async function swapOneSolToCoinLiteral(coinLiteral, amountC, literl) {
+  console.log("amount", amountC);
   if (!amountC || !literl) {
     return {
       status: "error",
