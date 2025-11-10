@@ -1,0 +1,73 @@
+import fs from "node:fs/promises";
+import path from "node:path";
+
+export class Store {
+  constructor(filePath, defaults = { token: "", amount: 0 }) {
+    this.filePath = filePath;
+    this.defaults = defaults;
+    this.cache = null;
+    this.queue = Promise.resolve();
+  }
+
+  async ensureDir() {
+    await fs.mkdir(path.dirname(this.filePath), { recursive: true });
+  }
+
+  async load() {
+    await this.ensureDir();
+    try {
+      const raw = await fs.readFile(this.filePath, "utf8");
+      const data = JSON.parse(raw);
+      this.cache = { token: "", amount: 0, ...data };
+      return this.cache;
+    } catch (e) {
+      if (e.code === "ENOENT") {
+        await this.save(this.defaults);
+        this.cache = structuredClone(this.defaults);
+        return this.cache;
+      }
+      throw e;
+    }
+  }
+
+  async save(next) {
+    await this.ensureDir();
+    const tmp = this.filePath + ".tmp";
+    await fs.writeFile(tmp, JSON.stringify(next, null, 2));
+    await fs.rename(tmp, this.filePath);
+    this.cache = next;
+    return next;
+  }
+
+  async getAll() {
+    if (!this.cache) await this.load();
+    return this.cache;
+  }
+
+  async setToken(value) {
+    const token = String(value).trim().toUpperCase();
+    const current = await this.getAll();
+    const changed = (current.token || "") !== token;
+
+    const next = {
+      ...current,
+      token,
+      ...(changed ? { amount: 0 } : {}), // <- сброс в 0 (можно поставить своё значение)
+    };
+
+    return this.enqueue(next);
+  }
+
+  async setAmount(value) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) throw new Error("amount must be a number");
+    const current = await this.getAll();
+    const next = { ...current, amount: n };
+    return this.enqueue(next);
+  }
+
+  enqueue(payload) {
+    this.queue = this.queue.then(() => this.save(payload));
+    return this.queue;
+  }
+}

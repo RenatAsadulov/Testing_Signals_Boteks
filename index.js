@@ -3,6 +3,8 @@ import { TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions/index.js";
 import { Api } from "telegram/index.js";
 import { NewMessage } from "telegram/events/index.js";
+import { swapOneSolToCoinLiteral } from "./features/swapWithJupiter.js";
+import settings from './data/settings.json' with { type: "json" };
 
 // --- ENV ---
 const apiId = Number(process.env.API_ID);
@@ -150,6 +152,15 @@ async function main() {
       console.log("ticker", ticker);
       if (!ticker) return;
 
+      const signature = await swapOneSolToCoinLiteral(ticker, settings.amount, settings.token);
+
+      if(signature.status !== "success") {
+        await client.sendMessage(
+          outboundChat.startsWith("@") ? outboundChat : BigInt(outboundChat),
+          { message: signature.text }
+        );
+      }
+
       const header = getHeaderLine(txt);
       const link = await tryExportMsgLink(client, chat, msg.id);
 
@@ -164,15 +175,12 @@ async function main() {
 
       // отправка результата в целевой чат
       const out =
-        `🔥 *New Trending*\n` +
-        `• Chat: ${chat.title}\n` +
-        `• Header: ${header}\n` +
-        `• Ticker: \`${ticker}\`\n` +
-        (link ? `• Link: ${link}\n` : "") +
-        `• MsgID: ${msg.id}`;
+        `• Bought: \`${ticker}\`\n` +
+        `Link: ${signature.text}`;
+
       await client.sendMessage(
         outboundChat.startsWith("@") ? outboundChat : BigInt(outboundChat),
-        { message: out, parseMode: "Markdown" }
+        { message: out }
       );
     } catch (e) {
       console.error("Handler error:", e.message);

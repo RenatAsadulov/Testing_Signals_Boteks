@@ -1,1 +1,0 @@
-Error: No route found for 1 SOL. Try higher slippage or another token.

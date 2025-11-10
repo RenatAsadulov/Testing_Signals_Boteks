@@ -7,6 +7,15 @@ import { Connection, Keypair, VersionedTransaction } from "@solana/web3.js";
 
 setDefaultResultOrder?.("ipv4first");
 
+const {
+  RPC_URL,
+  JUPITER_HOST,
+  JUPITER_IP,
+  WALLET_SECRET_KEY,
+  SLIPPAGE_BBS,
+  PRIORITY_MAX_LAMPORTS,
+} = process.env;
+
 // -----------------------------
 // Константы / заголовки
 // -----------------------------
@@ -18,12 +27,11 @@ const COMMON_HEADERS = {
 };
 
 async function resolveMintBySymbol(symbol) {
-  const query = symbol.trim().toUpperCase(); // "USDT"
-  const list = await jupSearchSymbol(query); // твоя функция на lite-api.jup.ag
+  const query = symbol.trim().toUpperCase();
+  const list = await jupSearchSymbol(query);
   const want = list.filter((t) => (t.symbol || "").toUpperCase() === query);
   if (!want.length) throw new Error(`No token found for ${symbol}`);
 
-  // предпочитаем verified и основной токен-программы (не token-2022)
   want.sort(
     (a, b) =>
       Number(!!b.verified) - Number(!!a.verified) ||
@@ -31,7 +39,7 @@ async function resolveMintBySymbol(symbol) {
         Number((a.tokenProgram || "") === "spl-token")
   );
 
-  const picked = want[0]; // { id, symbol, decimals, verified, tokenProgram, ... }
+  const picked = want[0];
   return { mint: picked.id, dec: picked.decimals, meta: picked };
 }
 
@@ -91,7 +99,7 @@ async function buildSignSendSwap({
     prioritizationFeeLamports: {
       priorityLevelWithMaxLamports: {
         priorityLevel: "high", // "low" | "medium" | "high" | "veryHigh" | "extreme"
-        maxLamports: 200_000,
+        maxLamports: priorityMaxLamports,
       },
     },
   });
@@ -163,6 +171,7 @@ async function jupSearchSymbol(symbol) {
   const { data } = await TOKENS_AX.get("/tokens/v2/search", {
     params: { query: symbol },
   });
+
   return data;
 }
 // -----------------------------
@@ -189,7 +198,7 @@ function pickExactSymbolPreferVerified(results, wantSym) {
 /**
  * Свап 1 SOL -> токен по литералу (например "$BONK"), Jupiter v6
  * @param {Object} env
- * @param {string} env.rpcUrl                    - Solana mainnet RPC
+ * @param {string} env.RPC_URL                    - Solana mainnet RPC
  * @param {string|number[]} env.walletSecretKey - base58 или JSON-массив байт
  * @param {number} [env.slippageBps=50]
  * @param {number} [env.priorityMaxLamports=200_000]
@@ -198,47 +207,55 @@ function pickExactSymbolPreferVerified(results, wantSym) {
  * @param {string} coinLiteral                   - "$BONK" | "BONK"
  * @returns {Promise<string>} подпись транзакции
  */
-export async function swapOneSolToCoinLiteral(env, coinLiteral, amountC) {
-  const slippageBps = env.slippageBps ?? 50;
-  const priorityMaxLamports = env.priorityMaxLamports ?? 1_000;
+export async function swapOneSolToCoinLiteral(coinLiteral, amountC, literl) {
+  if (!amountC || !literl) {
+    return {
+      status: "error",
+      text: "Complete configuration",
+    };
+  }
+  try {
+    const conn = new Connection(RPC_URL, { commitment: "confirmed" });
+    const wallet = keypairFromAny(WALLET_SECRET_KEY);
 
-  const conn = new Connection(env.rpcUrl, { commitment: "confirmed" });
-  const wallet = keypairFromAny(env.walletSecretKey);
+    // HTTP клиент для Jupiter v6
+    const JAX = createJupClient({
+      host: JUPITER_HOST || "quote-api.jup.ag",
+      ip: JUPITER_IP,
+    });
 
-  // HTTP клиент для Jupiter v6
-  const JAX = createJupClient({
-    host: env.jupHost || "quote-api.jup.ag",
-    ip: env.jupIp,
-  });
+    // 1) mint по символу
+    const outSym = normalizeLiteral(coinLiteral); // "$BONK" -> "BONK"
+    const list = await jupSearchSymbol(outSym);
+    let chosen = pickExactSymbolPreferVerified(list, outSym);
+    let outputMint = chosen.id;
+    const inToken = await resolveMintBySymbol(literl); // ← резолвим USDT
+    const uiAmount = amountC; // ← 10 USDT
+    const amount = toRawAmount(uiAmount, inToken.dec); // 10 * 10^6 -> "10000000"
 
-  // 1) mint по символу
-  const outSym = normalizeLiteral(coinLiteral); // "$BONK" -> "BONK"
-  const list = await jupSearchSymbol(outSym);
-  let chosen = pickExactSymbolPreferVerified(list, outSym);
-  let outputMint = chosen.id;
-  const inToken = await resolveMintBySymbol("USDT"); // ← резолвим USDT
-  const uiAmount = amountC; // ← 10 USDT
-  const amount = toRawAmount(uiAmount, inToken.dec); // 10 * 10^6 -> "10000000"
+    const params = {
+      inputMint: inToken.mint,
+      outputMint,
+      amount,
+      slippageBps: SLIPPAGE_BBS,
+      swapMode: "ExactIn",
+    };
 
-  const params = {
-    inputMint: inToken.mint, // ← теперь USDT mint
-    outputMint, // как раньше (mint целевой монеты по твоему литералу)
-    amount, // "10000000"
-    slippageBps, // как было (например, 50)
-    swapMode: "ExactIn",
-  };
+    const { data: quoteRaw } = await JAX.get("/v6/quote", { params });
 
-  const { data: quoteRaw } = await JAX.get("/v6/quote", { params });
+    const sig = await buildSignSendSwap({
+      jax: JAX,
+      q: quoteRaw,
+      conn,
+      wallet,
+      priorityMaxLamports: PRIORITY_MAX_LAMPORTS,
+    });
 
-  const sig = await buildSignSendSwap({
-    jax: JAX, // твой axios-клиент к Jupiter (с IP+SNI, который уже работает)
-    q: quoteRaw, // ПЕРЕДАВАЙ ВЕСЬ ОБЪЕКТ QUOTE из твоего лога
-    conn, // Connection к RPC
-    wallet, // Keypair (из base58/JSON)
-    priorityMaxLamports, // опционально
-  });
+    const solcanLink = `https://solscan.io/tx/${sig}`;
 
-  console.log("SIG", sig);
-
-  console.log("✅ Swap tx:", `https://solscan.io/tx/${sig}`);
+    return { status: "success", text: solcanLink };
+  } catch (error) {
+    console.log("ERROR", error);
+    return { status: "error", text: "Error: " + error.message };
+  }
 }
