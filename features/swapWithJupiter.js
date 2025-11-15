@@ -657,13 +657,51 @@ export async function getPricesByMint(mintOrMints, opt = {}) {
     ? opt.fallbackVsTokens
     : [];
 
-  const priceClient = __createPriceClient({});
+  const priceClients = PRICE_IP
+    ? [
+        { client: __createPriceClient({ host: PRICE_HOST, ip: PRICE_IP }), tag: "ip" },
+        { client: __createPriceClient({ host: PRICE_HOST, ip: undefined }), tag: "host" },
+      ]
+    : [{ client: __createPriceClient({ host: PRICE_HOST, ip: undefined }), tag: "host" }];
+
+  async function requestWithPriceClients(run, label) {
+    let lastErr;
+    for (let idx = 0; idx < priceClients.length; idx += 1) {
+      const { client, tag } = priceClients[idx];
+      try {
+        return await run(client);
+      } catch (err) {
+        lastErr = err;
+        const status = err?.response?.status;
+        const retriable =
+          !err?.response ||
+          status === 0 ||
+          status === 408 ||
+          status === 425 ||
+          status === 429 ||
+          (status >= 500 && status < 600);
+        const isLast = idx === priceClients.length - 1;
+        if (!retriable || isLast) {
+          throw err;
+        }
+        console.warn(
+          `${label} failed on price client (${tag}); retrying with fallback:`,
+          err?.message || err
+        );
+      }
+    }
+    throw lastErr;
+  }
 
   async function fetchForVsToken(vsTokenSymbolOrMint) {
     if (!vsTokenSymbolOrMint) {
-      const { data } = await priceClient.get("/v3/price", {
-        params: { ids: ids.join(",") },
-      });
+      const { data } = await requestWithPriceClients(
+        (client) =>
+          client.get("/v3/price", {
+            params: { ids: ids.join(",") },
+          }),
+        "Primary price fetch"
+      );
       return data?.data || {};
     }
 
@@ -677,14 +715,18 @@ export async function getPricesByMint(mintOrMints, opt = {}) {
       }
     }
 
-    const { data } = await priceClient.get("/v3/price", {
-      params: {
-        ids: ids.join(","),
-        vsToken: vsTokenId,
-        ...(opt.vsAmount ? { vsAmount: opt.vsAmount } : {}),
-        ...(opt.onlyVsToken ? { onlyVsToken: true } : {}),
-      },
-    });
+    const { data } = await requestWithPriceClients(
+      (client) =>
+        client.get("/v3/price", {
+          params: {
+            ids: ids.join(","),
+            vsToken: vsTokenId,
+            ...(opt.vsAmount ? { vsAmount: opt.vsAmount } : {}),
+            ...(opt.onlyVsToken ? { onlyVsToken: true } : {}),
+          },
+        }),
+      `Fallback price fetch for ${vsTokenSymbolOrMint}`
+    );
 
     return data?.data || {};
   }
