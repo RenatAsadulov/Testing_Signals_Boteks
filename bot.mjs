@@ -426,7 +426,10 @@ async function handleSellCallback(ctx, data) {
         `Сделка выполнена!\nСсылка: https://solscan.io/tx/${sig}`
       );
     } catch (e) {
-      await ctx.reply("Ошибка при выполнении сделки: " + e.message);
+      console.error("Sell execution error", e);
+      await ctx.reply(
+        "Не удалось выполнить сделку. Подождите ~30 секунд и попробуйте снова."
+      );
       return;
     } finally {
       resetSellFlow(ctx);
@@ -494,7 +497,10 @@ async function handleBuyCallback(ctx, data) {
         `Сделка выполнена!\nСсылка: https://solscan.io/tx/${sig}`
       );
     } catch (e) {
-      await ctx.reply("Ошибка при выполнении сделки: " + e.message);
+      console.error("Buy execution error", e);
+      await ctx.reply(
+        "Не удалось выполнить сделку. Подождите ~30 секунд и попробуйте снова."
+      );
       return;
     } finally {
       resetBuyFlow(ctx);
