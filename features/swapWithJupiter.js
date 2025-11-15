@@ -3,7 +3,12 @@ import axios from "axios";
 import https from "node:https";
 import bs58 from "bs58";
 import { setDefaultResultOrder } from "node:dns";
-import { Connection, Keypair, VersionedTransaction } from "@solana/web3.js";
+import {
+  Connection,
+  Keypair,
+  PublicKey,
+  VersionedTransaction,
+} from "@solana/web3.js";
 
 setDefaultResultOrder?.("ipv4first");
 
@@ -15,6 +20,56 @@ const {
   SLIPPAGE_BBS,
   PRIORITY_MAX_LAMPORTS,
 } = process.env;
+
+const SOL_MINT = "So11111111111111111111111111111111111111112";
+const SOL_DECIMALS = 9;
+const SPL_TOKEN_PROGRAM_ID = new PublicKey(
+  "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+);
+
+let __connection;
+let __wallet;
+let __jax;
+
+function ensureConnection() {
+  if (!RPC_URL) throw new Error("RPC_URL is not configured");
+  if (!__connection) {
+    __connection = new Connection(RPC_URL, { commitment: "confirmed" });
+  }
+  return __connection;
+}
+
+function ensureWallet() {
+  if (!WALLET_SECRET_KEY) throw new Error("WALLET_SECRET_KEY is not configured");
+  if (!__wallet) {
+    __wallet = keypairFromAny(WALLET_SECRET_KEY);
+  }
+  return __wallet;
+}
+
+function ensureJax() {
+  if (!__jax) {
+    __jax = createJupClient({
+      host: JUPITER_HOST || "quote-api.jup.ag",
+      ip: JUPITER_IP,
+    });
+  }
+  return __jax;
+}
+
+function getDefaultSlippageBps() {
+  const fallback = 50;
+  if (!SLIPPAGE_BBS) return fallback;
+  const parsed = Number(SLIPPAGE_BBS);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function getPriorityFeeLamports() {
+  const fallback = 200_000;
+  if (!PRIORITY_MAX_LAMPORTS) return fallback;
+  const parsed = Number(PRIORITY_MAX_LAMPORTS);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
 
 // -----------------------------
 // Константы / заголовки
@@ -174,6 +229,31 @@ async function jupSearchSymbol(symbol) {
 
   return data;
 }
+
+async function fetchTokenMetadataMap(mints) {
+  const uniqueMints = Array.from(
+    new Set((mints || []).filter((mint) => typeof mint === "string" && mint))
+  );
+  if (!uniqueMints.length) return {};
+
+  const out = {};
+
+  await Promise.allSettled(
+    uniqueMints.map(async (mint) => {
+      try {
+        const { data } = await TOKENS_AX.get("/tokens/v2/search", {
+          params: { query: mint },
+        });
+        const match = (data || []).find((entry) => entry.id === mint);
+        if (match) out[mint] = match;
+      } catch (err) {
+        console.warn("Failed to fetch token metadata", mint, err?.message || err);
+      }
+    })
+  );
+
+  return out;
+}
 // -----------------------------
 // Jupiter v6 (через IP/SNI при необходимости)
 // -----------------------------
@@ -217,6 +297,23 @@ function formatNumber(value) {
     : "unknown";
 }
 
+function pickPriceValue(info) {
+  if (!info || typeof info !== "object") return null;
+  const candidates = [
+    info.price,
+    info.priceUsd,
+    info.usd,
+    info.value,
+    info.priceInfo?.price,
+    info.data?.price,
+  ];
+  for (const candidate of candidates) {
+    const num = Number(candidate);
+    if (Number.isFinite(num) && num > 0) return num;
+  }
+  return null;
+}
+
 export async function swapOneSolToCoinLiteral(
   coinLiteral,
   amountC,
@@ -230,14 +327,11 @@ export async function swapOneSolToCoinLiteral(
     };
   }
   try {
-    const conn = new Connection(RPC_URL, { commitment: "confirmed" });
-    const wallet = keypairFromAny(WALLET_SECRET_KEY);
+    const conn = ensureConnection();
+    const wallet = ensureWallet();
 
     // HTTP клиент для Jupiter v6
-    const JAX = createJupClient({
-      host: JUPITER_HOST || "quote-api.jup.ag",
-      ip: JUPITER_IP,
-    });
+    const JAX = ensureJax();
 
     // 1) mint по символу
     const outSym = normalizeLiteral(coinLiteral); // "$BONK" -> "BONK"
@@ -271,7 +365,7 @@ export async function swapOneSolToCoinLiteral(
       inputMint: inToken.mint,
       outputMint,
       amount,
-      slippageBps: SLIPPAGE_BBS,
+      slippageBps: getDefaultSlippageBps(),
       swapMode: "ExactIn",
     };
 
@@ -282,7 +376,7 @@ export async function swapOneSolToCoinLiteral(
       q: quoteRaw,
       conn,
       wallet,
-      priorityMaxLamports: PRIORITY_MAX_LAMPORTS,
+      priorityMaxLamports: getPriorityFeeLamports(),
     });
 
     const solcanLink = `https://solscan.io/tx/${sig}`;
@@ -300,9 +394,186 @@ export async function swapOneSolToCoinLiteral(
   }
 }
 
-// ====== Jupiter Price API (drop-in) ========================================
+export async function resolveSymbolToMint(symbol) {
+  return resolveMintBySymbol(symbol);
+}
+
+export async function fetchWalletTokens({ vsToken = "USDT" } = {}) {
+  const conn = ensureConnection();
+  const wallet = ensureWallet();
+
+  const [solLamports, tokenAccounts] = await Promise.all([
+    conn.getBalance(wallet.publicKey, "confirmed"),
+    conn.getParsedTokenAccountsByOwner(wallet.publicKey, {
+      programId: SPL_TOKEN_PROGRAM_ID,
+    }),
+  ]);
+
+  const tokens = [];
+
+  if (solLamports > 0) {
+    const solUi = solLamports / 10 ** SOL_DECIMALS;
+    tokens.push({
+      mint: SOL_MINT,
+      decimals: SOL_DECIMALS,
+      rawAmount: solLamports.toString(),
+      uiAmount: solUi,
+      uiAmountString: solUi.toString(),
+      source: "sol",
+    });
+  }
+
+  for (const acc of tokenAccounts.value || []) {
+    const parsed = acc.account?.data?.parsed;
+    const info = parsed?.info;
+    const tokenAmount = info?.tokenAmount;
+    if (!info || !tokenAmount) continue;
+    const rawAmount = tokenAmount.amount;
+    if (!rawAmount || rawAmount === "0") continue;
+    const decimals = Number(tokenAmount.decimals ?? 0);
+    const uiAmountString = tokenAmount.uiAmountString || String(tokenAmount.uiAmount || 0);
+    const uiAmount = Number(uiAmountString);
+    if (!Number.isFinite(uiAmount) || uiAmount <= 0) continue;
+    tokens.push({
+      mint: info.mint,
+      decimals,
+      rawAmount,
+      uiAmount,
+      uiAmountString,
+      source: "spl",
+    });
+  }
+
+  if (!tokens.length) return [];
+
+  const aggregated = new Map();
+  for (const token of tokens) {
+    const key = token.mint;
+    const existing = aggregated.get(key);
+    if (!existing) {
+      aggregated.set(key, { ...token });
+      continue;
+    }
+    existing.rawAmount = (
+      BigInt(existing.rawAmount) + BigInt(token.rawAmount)
+    ).toString();
+    existing.uiAmount = Number(existing.uiAmount) + Number(token.uiAmount);
+    existing.uiAmountString = (
+      Number(existing.uiAmountString) + Number(token.uiAmount)
+    ).toString();
+  }
+
+  const consolidated = Array.from(aggregated.values());
+
+  let priceByMint = {};
+  const fallbackVsTokens = [];
+  if (vsToken && vsToken.toUpperCase() !== "USDC") {
+    fallbackVsTokens.push("USDC");
+  }
+  fallbackVsTokens.push(null);
+
+  try {
+    priceByMint = await getPricesByMint(consolidated.map((t) => t.mint), {
+      vsToken,
+      fallbackVsTokens,
+    });
+  } catch (e) {
+    console.warn("Failed to load prices:", e.message);
+  }
+
+  let metaByMint = {};
+  try {
+    metaByMint = await fetchTokenMetadataMap(consolidated.map((t) => t.mint));
+  } catch (e) {
+    console.warn("Failed to load token metadata:", e.message);
+  }
+
+  const enriched = consolidated.map((token) => {
+    const price = priceByMint[token.mint] || null;
+    const priceUsdt = pickPriceValue(price);
+    const valueUsdt =
+      priceUsdt != null && Number.isFinite(priceUsdt)
+        ? priceUsdt * Number(token.uiAmount)
+        : null;
+    const meta = metaByMint[token.mint] || {};
+    return {
+      ...token,
+      symbol:
+        meta.symbol ||
+        price?.symbol ||
+        (token.mint === SOL_MINT ? "SOL" : token.mint.slice(0, 6)),
+      name: meta.name || price?.name || null,
+      priceUsdt,
+      valueUsdt,
+    };
+  });
+
+  enriched.sort((a, b) => {
+    const va = Number.isFinite(a.valueUsdt) ? a.valueUsdt : -1;
+    const vb = Number.isFinite(b.valueUsdt) ? b.valueUsdt : -1;
+    return vb - va;
+  });
+
+  return enriched;
+}
+
+export async function getSwapQuote({
+  inputMint,
+  outputMint,
+  amount,
+  slippageBps,
+  swapMode = "ExactIn",
+}) {
+  const jax = ensureJax();
+  const params = {
+    inputMint,
+    outputMint,
+    amount,
+    swapMode,
+    slippageBps: slippageBps ?? getDefaultSlippageBps(),
+  };
+  try {
+    const { data } = await jax.get("/v6/quote", { params });
+    return data;
+  } catch (err) {
+    const { response } = err || {};
+    const payload = response?.data || {};
+    const code = payload.errorCode || payload.code;
+    const rawMessage =
+      payload.error || payload.message || response?.statusText || err?.message;
+
+    if (code === "COULD_NOT_FIND_ANY_ROUTE") {
+      throw new Error(
+        "Jupiter не нашёл маршрут для этого обмена. Попробуйте уменьшить сумму или выбрать другую пару."
+      );
+    }
+
+    if (rawMessage) {
+      throw new Error(rawMessage);
+    }
+
+    throw err;
+  }
+}
+
+export async function executeSwapQuote(quoteResponse, opt = {}) {
+  if (!quoteResponse) throw new Error("quoteResponse is required");
+  const conn = ensureConnection();
+  const wallet = ensureWallet();
+  const jax = ensureJax();
+  return buildSignSendSwap({
+    jax,
+    q: quoteResponse,
+    conn,
+    wallet,
+    priorityMaxLamports: opt.priorityMaxLamports ?? getPriorityFeeLamports(),
+  });
+}
+
+export { toRawAmount };
+
+// ====== Jupiter Price API (Lite implementation based on dev docs) ==========
 // Требуются axios и https уже импортированные в файле.
-// Опциональные ENV: PRICE_HOST=price.jup.ag, PRICE_IP=<ip>
 
 const __PRICE_HEADERS =
   typeof COMMON_HEADERS !== "undefined"
@@ -314,27 +585,67 @@ const __PRICE_HEADERS =
         referer: "https://jup.ag/",
       };
 
-const { PRICE_HOST = "price.jup.ag", PRICE_IP } = process.env;
+const PRICE_BASE_URL = "https://lite-api.jup.ag"; // TODO: вынести в .env, когда появится необходимость менять маршрут
+const PRICE_TIMEOUT_MS = 15000;
+const PRICE_BATCH_SIZE = 100;
+const PRICE_DEFAULT_VS_TOKEN = "USDC";
 
-function __createPriceClient({ host = PRICE_HOST, ip = PRICE_IP } = {}) {
-  if (ip) {
-    return axios.create({
-      baseURL: `https://${ip}`,
-      httpsAgent: new https.Agent({
-        family: 4,
-        keepAlive: false,
-        servername: host,
-      }),
-      headers: { ...__PRICE_HEADERS, host },
-      timeout: 15000,
-    });
-  }
+function __createPriceAxios(baseURL) {
   return axios.create({
-    baseURL: `https://${host}`,
-    httpsAgent: new https.Agent({ family: 4, keepAlive: false }),
+    baseURL,
+    timeout: PRICE_TIMEOUT_MS,
+    httpsAgent: new https.Agent({ keepAlive: true }),
     headers: { ...__PRICE_HEADERS },
-    timeout: 15000,
   });
+}
+
+function __buildPriceClients() {
+  const clients = [];
+  clients.push({
+    tag: "lite-host",
+    client: __createPriceAxios(PRICE_BASE_URL),
+  });
+
+  return clients;
+}
+
+const __PRICE_CLIENTS = __buildPriceClients();
+
+function __isRetriablePriceError(err) {
+  if (!err) return false;
+  if (err.code && ["ECONNRESET", "ENOTFOUND", "ECONNREFUSED", "EAI_AGAIN"].includes(err.code)) {
+    return true;
+  }
+  const status = err?.response?.status;
+  if (!status) return true;
+  if (status === 408 || status === 425 || status === 429) return true;
+  return status >= 500 && status < 600;
+}
+
+async function __requestPrice(path, params, { label, signal } = {}) {
+  if (!__PRICE_CLIENTS.length) {
+    throw new Error("Price clients are not configured");
+  }
+
+  let lastErr;
+  for (let idx = 0; idx < __PRICE_CLIENTS.length; idx += 1) {
+    const { client, tag } = __PRICE_CLIENTS[idx];
+    try {
+      return await client.get(path, { params, signal });
+    } catch (err) {
+      lastErr = err;
+      const retriable = __isRetriablePriceError(err);
+      const isLast = idx === __PRICE_CLIENTS.length - 1;
+      if (!retriable || isLast) {
+        throw err;
+      }
+      console.warn(
+        `${label || path} failed on price client (${tag}); retrying with fallback:`,
+        err?.message || err
+      );
+    }
+  }
+  throw lastErr;
 }
 
 // ---- Tokens v2 search (используем существующий TOKENS_AX, если он есть)
@@ -343,7 +654,7 @@ const __TOK_AX =
     ? TOKENS_AX
     : axios.create({
         baseURL: "https://lite-api.jup.ag",
-        httpsAgent: new https.Agent({ family: 4, keepAlive: false }),
+        httpsAgent: new https.Agent({ keepAlive: true }),
         headers: { ...__PRICE_HEADERS },
         timeout: 15000,
       });
@@ -373,34 +684,133 @@ async function __resolveMintBySymbol(symbol) {
   return { mint: picked.id, dec: picked.decimals ?? 0, meta: picked };
 }
 
+function __chunk(array, size) {
+  const chunks = [];
+  for (let i = 0; i < array.length; i += size) {
+    chunks.push(array.slice(i, i + size));
+  }
+  return chunks;
+}
+
+const __vsTokenCache = new Map();
+
+async function __ensureVsTokenId(vsToken) {
+  if (!vsToken) return null;
+  if (vsToken.length >= 32) return vsToken;
+  const key = vsToken.toUpperCase();
+  if (__vsTokenCache.has(key)) return __vsTokenCache.get(key);
+  try {
+    const resolved = await __resolveMintBySymbol(vsToken);
+    __vsTokenCache.set(key, resolved.mint);
+    return resolved.mint;
+  } catch {
+    __vsTokenCache.set(key, vsToken);
+    return vsToken;
+  }
+}
+
+function __normalizeVsCandidates(primary, extras, includeNull = true) {
+  const seen = new Set();
+  const ordered = [];
+
+  function push(value) {
+    const key = value ?? "__null__";
+    if (seen.has(key)) return;
+    seen.add(key);
+    ordered.push(value ?? null);
+  }
+
+  if (primary !== undefined) {
+    push(primary);
+  }
+
+  for (const extra of extras || []) {
+    if (extra === undefined) continue;
+    push(extra);
+  }
+
+  if (includeNull) {
+    push(null);
+  }
+
+  return ordered;
+}
+
 // ---------------- PUBLIC API ----------------
 
 /** Цена(ы) по mint(ам). По умолчанию в USDC. */
 export async function getPricesByMint(mintOrMints, opt = {}) {
-  const jax = __createPriceClient({});
-  const ids = Array.isArray(mintOrMints) ? mintOrMints : [mintOrMints];
+  const ids = (Array.isArray(mintOrMints) ? mintOrMints : [mintOrMints])
+    .map((id) => String(id || "").trim())
+    .filter(Boolean);
+  if (!ids.length) return {};
 
-  // vsToken может быть символом — попробуем резолвнуть в mint
-  let vsTokenId = opt.vsToken || "USDC";
-  if (vsTokenId && vsTokenId.length < 32) {
+  const fallbackVsTokens = Array.isArray(opt.fallbackVsTokens)
+    ? opt.fallbackVsTokens.filter((v) => v !== undefined)
+    : [];
+
+  const vsCandidates = __normalizeVsCandidates(
+    opt.vsToken !== undefined ? opt.vsToken : PRICE_DEFAULT_VS_TOKEN,
+    fallbackVsTokens,
+    opt.allowNoVsToken !== false
+  );
+
+  const uniqueIds = [...new Set(ids)];
+  const remaining = new Set(uniqueIds);
+  const prices = {};
+
+  for (const vsCandidate of vsCandidates) {
+    if (!remaining.size) break;
+
+    let vsTokenId = vsCandidate;
     try {
-      const vs = await __resolveMintBySymbol(vsTokenId);
-      vsTokenId = vs.mint;
-    } catch {
-      /* игнор, Jupiter вернёт дефолтные валюты */
+      vsTokenId = await __ensureVsTokenId(vsCandidate);
+    } catch (err) {
+      console.warn(
+        `Failed to resolve vsToken ${vsCandidate}:`,
+        err?.message || err
+      );
+      continue;
+    }
+
+    const chunks = __chunk(Array.from(remaining), PRICE_BATCH_SIZE);
+    for (const chunk of chunks) {
+      const params = {
+        ids: chunk.join(","),
+        ...(vsTokenId ? { vsToken: vsTokenId } : {}),
+        ...(opt.vsAmount ? { vsAmount: opt.vsAmount } : {}),
+        ...(opt.onlyVsToken ? { onlyVsToken: true } : {}),
+        ...(opt.showExtraInfo ?? true ? { showExtraInfo: true } : {}),
+      };
+
+      try {
+        const { data } = await __requestPrice(
+          "/price/v3",
+          params,
+          {
+            label: `Price fetch vs ${vsCandidate || "default"}`,
+            signal: opt.signal,
+          }
+        );
+        const map = data?.data || {};
+        for (const id of chunk) {
+          const info = map[id];
+          if (info && !prices[id]) {
+            prices[id] = info;
+            remaining.delete(id);
+          }
+        }
+      } catch (err) {
+        console.warn(
+          `Price fetch failed for vsToken=${vsCandidate || "default"}:`,
+          err?.message || err
+        );
+        break;
+      }
     }
   }
 
-  const { data } = await jax.get("/v3/price", {
-    params: {
-      ids: ids.join(","),
-      ...(vsTokenId ? { vsToken: vsTokenId } : {}),
-      ...(opt.vsAmount ? { vsAmount: opt.vsAmount } : {}),
-      ...(opt.onlyVsToken ? { onlyVsToken: true } : {}),
-    },
-  });
-
-  return data?.data || {};
+  return prices;
 }
 
 /** Цена по символу (например 'SOL'/'BONK'). */
@@ -426,13 +836,19 @@ export async function getPricesBySymbols(symbols, opt = {}) {
 
 /** Изменение цены за период: "24h" | "7d" | "30d". */
 export async function getPriceChanges(mints, interval = "24h") {
-  const jax = __createPriceClient({});
-  const { data } = await jax.get("/v3/price-changes", {
-    params: {
-      ids: (Array.isArray(mints) ? mints : [mints]).join(","),
+  const ids = (Array.isArray(mints) ? mints : [mints])
+    .map((id) => String(id || "").trim())
+    .filter(Boolean);
+  if (!ids.length) return {};
+
+  const { data } = await __requestPrice(
+    "/price/v3/price-changes",
+    {
+      ids: ids.join(","),
       interval,
     },
-  });
+    { label: "Price changes fetch" }
+  );
   return data?.data || {};
 }
 // ============================================================================
