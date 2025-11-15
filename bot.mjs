@@ -45,11 +45,7 @@ function makeKeyboard(settings) {
 
 function makeMainMenuKeyboard() {
   return Markup.keyboard(
-    [
-      ["Sell", "Buy"],
-      ["Statistics", "Configuration"],
-      ["Trade-Bot"],
-    ],
+    [["Sell", "Buy"], ["Statistics", "Configuration"], ["Trade-Bot"]],
     { columns: 2 }
   )
     .resize()
@@ -64,10 +60,7 @@ function hasSettings(settings) {
 
 async function replyWithSettings(ctx) {
   const s = await store.getAll();
-  await ctx.reply("Current values:", makeKeyboard(s));
-  if (hasSettings(s)) {
-    await ctx.reply("Trade-Bot", makeMainMenuKeyboard());
-  }
+  await ctx.reply("Trade-Bot", makeMainMenuKeyboard());
 }
 
 const NUMERIC_EDIT_FIELDS = {
@@ -138,10 +131,13 @@ async function beginNumericEdit(ctx, field) {
     buffer: initial === "0" ? "" : initial,
     messageId: null,
   };
-  const res = await ctx.reply(numericPromptText(field, ctx.session.numericEdit.buffer), {
-    parse_mode: "Markdown",
-    ...makeNumericKeyboard(),
-  });
+  const res = await ctx.reply(
+    numericPromptText(field, ctx.session.numericEdit.buffer),
+    {
+      parse_mode: "Markdown",
+      ...makeNumericKeyboard(),
+    }
+  );
   ctx.session.numericEdit.messageId = res.message_id;
 }
 
@@ -170,10 +166,9 @@ async function handleNumericCallback(ctx, action) {
       const info = NUMERIC_EDIT_FIELDS[edit.field];
       const persisted = await info.persist(edit.buffer);
       ctx.session.numericEdit = null;
-      await ctx.editMessageText(
-        `Сохранено: ${info.title} = ${persisted}`,
-        { parse_mode: "Markdown" }
-      );
+      await ctx.editMessageText(`Сохранено: ${info.title} = ${persisted}`, {
+        parse_mode: "Markdown",
+      });
       await replyWithSettings(ctx);
     } catch (e) {
       await ctx.reply("Error: " + e.message).catch(() => {});
