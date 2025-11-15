@@ -74,6 +74,7 @@ function withMongoGuard(fn) {
 }
 
 const HISTORY_LIMIT = 50;
+const TRADING_HISTORY_LIMIT = 200;
 
 export const saveSettingsDocument = withMongoGuard(
   async (db, settings, meta = {}) => {
@@ -200,6 +201,79 @@ export const updateWalletAggregate = withMongoGuard(
       .replaceOne({ _id: "wallet" }, doc, { upsert: true });
   }
 );
+
+export const saveTradingState = withMongoGuard(async (db, state) => {
+  if (!state || typeof state !== "object") return null;
+  const collection = db.collection(STATE_COLLECTION);
+  const now = new Date();
+  const positions = Array.isArray(state.positions)
+    ? state.positions.map((entry) => ({
+        ...entry,
+        costBaseAmount: Number(entry?.costBaseAmount ?? entry?.costUsd ?? 0),
+        costUsd: Number(entry?.costUsd ?? entry?.costBaseAmount ?? 0),
+      }))
+    : [];
+  const history = Array.isArray(state.history)
+    ? state.history.slice(-TRADING_HISTORY_LIMIT)
+    : [];
+  const summary = state.summary && typeof state.summary === "object"
+    ? {
+        ...state.summary,
+        totalInvestedUsd: Number(state.summary.totalInvestedUsd || 0),
+        totalReturnedUsd: Number(state.summary.totalReturnedUsd || 0),
+        totalProfitUsd: Number(state.summary.totalProfitUsd || 0),
+        totalProfitPercent: Number(state.summary.totalProfitPercent || 0),
+        totalClosedTrades: Number(state.summary.totalClosedTrades || 0),
+        totalOpenPositions: Number(state.summary.totalOpenPositions || 0),
+        updatedAt: now,
+      }
+    : { updatedAt: now };
+
+  const doc = {
+    _id: "tradingResults",
+    positions,
+    history,
+    summary,
+    updatedAt: now,
+  };
+
+  return collection.replaceOne({ _id: "tradingResults" }, doc, {
+    upsert: true,
+  });
+});
+
+export const loadTradingState = withMongoGuard(async (db) => {
+  const doc = await db
+    .collection(STATE_COLLECTION)
+    .findOne({ _id: "tradingResults" });
+  if (!doc) return null;
+  const positions = Array.isArray(doc.positions)
+    ? doc.positions.map((entry) => ({
+        ...entry,
+        costBaseAmount: Number(entry?.costBaseAmount ?? entry?.costUsd ?? 0),
+        costUsd: Number(entry?.costUsd ?? entry?.costBaseAmount ?? 0),
+      }))
+    : [];
+  const history = Array.isArray(doc.history) ? doc.history : [];
+  const summary = doc.summary || {};
+  return { positions, history, summary, updatedAt: doc.updatedAt || null };
+});
+
+export const getTradingSummary = withMongoGuard(async (db) => {
+  const doc = await db
+    .collection(STATE_COLLECTION)
+    .findOne({ _id: "tradingResults" });
+  if (!doc || !doc.summary) return null;
+  return {
+    ...doc.summary,
+    totalInvestedUsd: Number(doc.summary.totalInvestedUsd || 0),
+    totalReturnedUsd: Number(doc.summary.totalReturnedUsd || 0),
+    totalProfitUsd: Number(doc.summary.totalProfitUsd || 0),
+    totalProfitPercent: Number(doc.summary.totalProfitPercent || 0),
+    totalClosedTrades: Number(doc.summary.totalClosedTrades || 0),
+    totalOpenPositions: Number(doc.summary.totalOpenPositions || 0),
+  };
+});
 
 export function mongoIsActive() {
   return !disabled;
