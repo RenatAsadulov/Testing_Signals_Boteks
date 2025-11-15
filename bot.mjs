@@ -61,6 +61,7 @@ function makeMainMenuKeyboard() {
 
 const SELL_PRICE_VS = "USDT";
 const SELL_TARGET_CACHE = {};
+const BUY_TARGET_CACHE = {};
 const SOL_TARGET_INFO = {
   symbol: "SOL",
   mint: "So11111111111111111111111111111111111111112",
@@ -88,6 +89,101 @@ function formatAmount(value) {
   return amountFormatter.format(value);
 }
 
+function formatUsdDetailed(value) {
+  if (!Number.isFinite(value)) return "неизвестно";
+  if (Math.abs(value) >= 1) return formatUsd(value);
+  return `≈$${Number(value).toPrecision(4)}`;
+}
+
+function pickMetaNumber(meta, keys) {
+  if (!meta || typeof meta !== "object") return null;
+  for (const key of keys) {
+    const parts = key.split(".");
+    let value = meta;
+    for (const part of parts) {
+      if (!value || typeof value !== "object") {
+        value = undefined;
+        break;
+      }
+      value = value[part];
+    }
+    const num = Number(value);
+    if (Number.isFinite(num)) return num;
+  }
+  return null;
+}
+
+function formatTokenMetaInfo({ symbol, meta }) {
+  const lines = [];
+  const name = meta?.name || meta?.tokenName || null;
+  lines.push(
+    name ? `Токен: ${symbol} (${name})` : `Токен: ${symbol}`
+  );
+
+  const price =
+    pickMetaNumber(meta, [
+      "price",
+      "usdPrice",
+      "priceUsd",
+      "priceInfo.price",
+      "data.price",
+    ]) ?? null;
+  if (Number.isFinite(price)) {
+    lines.push(`Цена: ${formatUsdDetailed(price)}`);
+  }
+
+  const liquidity =
+    pickMetaNumber(meta, [
+      "liquidity",
+      "liquidityUsd",
+      "liquidityUSD",
+      "marketInfo.liquidity",
+    ]) ?? null;
+  if (Number.isFinite(liquidity)) {
+    lines.push(`Ликвидность: ${formatUsdDetailed(liquidity)}`);
+  }
+
+  const marketCap =
+    pickMetaNumber(meta, [
+      "marketCap",
+      "market_cap",
+      "marketcap",
+      "fullyDilutedValue",
+    ]) ?? null;
+  if (Number.isFinite(marketCap)) {
+    lines.push(`Рыночная кап.: ${formatUsdDetailed(marketCap)}`);
+  }
+
+  const volume24h =
+    pickMetaNumber(meta, [
+      "volume24h",
+      "volume24hUsd",
+      "marketInfo.volume24h",
+    ]) ?? null;
+  if (Number.isFinite(volume24h)) {
+    lines.push(`Объём 24ч: ${formatUsdDetailed(volume24h)}`);
+  }
+
+  const change24h =
+    pickMetaNumber(meta, [
+      "priceChange24h",
+      "priceChangePct24h",
+      "priceChangePercentage24h",
+      "price24hChangePercent",
+    ]) ?? null;
+  if (Number.isFinite(change24h)) {
+    let value = Number(change24h);
+    if (Math.abs(value) <= 1) {
+      value *= 100;
+    }
+    const suffix = "%";
+    const formatted = value.toFixed(2);
+    lines.push(`Изм. 24ч: ${formatted}${suffix}`);
+  }
+
+  return lines;
+}
+
 function chunk(array, size) {
   const out = [];
   for (let i = 0; i < array.length; i += size) {
@@ -105,9 +201,28 @@ async function getSellTarget(symbol) {
   return info;
 }
 
+async function getBuyTarget(symbol) {
+  const key = symbol.toUpperCase();
+  if (BUY_TARGET_CACHE[key]) return BUY_TARGET_CACHE[key];
+  const resolved = await resolveSymbolToMint(key);
+  const info = {
+    symbol: resolved.meta?.symbol || key,
+    mint: resolved.mint,
+    decimals: resolved.dec,
+    meta: resolved.meta || {},
+  };
+  BUY_TARGET_CACHE[key] = info;
+  return info;
+}
+
 function resetSellFlow(ctx) {
   if (!ctx.session) return;
   ctx.session.sellFlow = null;
+}
+
+function resetBuyFlow(ctx) {
+  if (!ctx.session) return;
+  ctx.session.buyFlow = null;
 }
 
 async function handleSellStart(ctx) {
@@ -159,6 +274,84 @@ async function handleSellStart(ctx) {
     console.error("Sell start error:", e);
     await ctx.reply("Не удалось получить список токенов: " + e.message);
   }
+}
+
+async function handleBuyStart(ctx) {
+  ctx.session ??= {};
+  resetBuyFlow(ctx);
+  try {
+    ctx.session.buyFlow = {
+      stage: "awaiting_symbol",
+    };
+    await ctx.reply(
+      "Введите символ токена, который хотите купить (например, $PEPE)."
+    );
+  } catch (e) {
+    console.error("Buy start error:", e);
+    await ctx.reply("Не удалось начать процесс покупки: " + e.message);
+  }
+}
+
+async function ensureBuyPaymentTokens(flow) {
+  if (flow.paymentTokens) return flow.paymentTokens;
+  const tokensRaw = await fetchWalletTokens();
+  const tokenMap = {};
+  for (const token of tokensRaw) {
+    const symbol = token.symbol || token.name || token.mint.slice(0, 6);
+    tokenMap[token.mint] = { ...token, symbol };
+  }
+  flow.paymentTokens = tokenMap;
+  return tokenMap;
+}
+
+function makeBuyPaymentKeyboard(flow) {
+  const tokens = Object.values(flow.paymentTokens || {});
+  if (!tokens.length) return null;
+  const rows = tokens.map((token) =>
+    Markup.button.callback(
+      `${token.symbol} • ${formatAmount(token.uiAmount)}`,
+      `buy:pay:${token.mint}`
+    )
+  );
+  rows.push(Markup.button.callback("Отмена", "buy:cancel"));
+  return Markup.inlineKeyboard(chunk(rows, 1));
+}
+
+function formatBuyQuotePreview(flow) {
+  const { quote, paymentToken, targetToken, amountUi } = flow;
+  const lines = [
+    "Предпросмотр сделки",
+    `Отправляете: ${formatAmount(amountUi)} ${paymentToken.symbol}`,
+  ];
+  const outAmount = quote?.outAmount
+    ? Number(quote.outAmount) / 10 ** targetToken.decimals
+    : null;
+  if (Number.isFinite(outAmount)) {
+    lines.push(`Получите ≈ ${formatAmount(outAmount)} ${targetToken.symbol}`);
+  }
+  const minOut = quote?.otherAmountThreshold
+    ? Number(quote.otherAmountThreshold) / 10 ** targetToken.decimals
+    : null;
+  if (Number.isFinite(minOut)) {
+    lines.push(
+      `Мин. получение: ${formatAmount(minOut)} ${targetToken.symbol}`
+    );
+  }
+  const priceImpact = quote?.priceImpactPct
+    ? Number(quote.priceImpactPct) * 100
+    : null;
+  if (Number.isFinite(priceImpact)) {
+    lines.push(`Просадка: ${priceImpact.toFixed(2)}%`);
+  }
+  const totalFeesLamports = Number(
+    quote?.fees?.totalFeeAndDeposits ?? quote?.fees?.signatureFee ?? 0
+  );
+  if (Number.isFinite(totalFeesLamports) && totalFeesLamports > 0) {
+    const feeSol = totalFeesLamports / 10 ** SOL_TARGET_INFO.decimals;
+    lines.push(`Сетевые комиссии: ${feeSol.toFixed(6)} SOL`);
+  }
+  lines.push("Подтвердите, чтобы выполнить обмен.");
+  return lines;
 }
 
 async function handleSellCallback(ctx, data) {
@@ -248,6 +441,182 @@ async function handleSellCallback(ctx, data) {
   }
 
   await ctx.reply("Неизвестное действие. Попробуйте снова начать процесс продажи.");
+}
+
+async function handleBuyCallback(ctx, data) {
+  await ctx.answerCbQuery().catch(() => {});
+  ctx.session ??= {};
+  const flow = ctx.session.buyFlow;
+  if (!flow) {
+    await ctx.reply("Сессия покупки не активна. Нажмите Buy, чтобы начать заново.");
+    return;
+  }
+
+  const parts = data.split(":");
+  const action = parts[1];
+  const payload = parts.slice(2).join(":");
+
+  if (action === "pay") {
+    if (!flow.targetToken) {
+      await ctx.reply("Сначала выберите токен для покупки.");
+      return;
+    }
+    try {
+      await ensureBuyPaymentTokens(flow);
+    } catch (e) {
+      await ctx.reply("Не удалось загрузить список токенов: " + e.message);
+      return;
+    }
+    const token = flow.paymentTokens?.[payload];
+    if (!token) {
+      await ctx.reply("Не удалось определить токен оплаты. Попробуйте снова.");
+      return;
+    }
+    flow.paymentToken = token;
+    flow.stage = "awaiting_amount";
+    const availableAmount = formatAmount(token.uiAmount);
+    const availableValue = formatUsd(token.valueUsdt);
+    await ctx.reply(
+      `Введите количество ${token.symbol} для обмена (доступно ${availableAmount}, ${availableValue}). Вы можете ввести число или MAX.`
+    );
+    return;
+  }
+
+  if (action === "confirm") {
+    if (flow.stage !== "awaiting_confirmation" || !flow.quote) {
+      await ctx.reply("Нет данных для подтверждения. Начните заново.");
+      return;
+    }
+    try {
+      await ctx.reply("Выполняю обмен, пожалуйста подождите...");
+      const sig = await executeSwapQuote(flow.quote);
+      await ctx.reply(
+        `Сделка выполнена!\nСсылка: https://solscan.io/tx/${sig}`
+      );
+    } catch (e) {
+      await ctx.reply("Ошибка при выполнении сделки: " + e.message);
+      return;
+    } finally {
+      resetBuyFlow(ctx);
+    }
+    return;
+  }
+
+  if (action === "cancel") {
+    resetBuyFlow(ctx);
+    await ctx.reply("Операция покупки отменена.");
+    return;
+  }
+
+  await ctx.reply("Неизвестное действие. Попробуйте снова начать процесс покупки.");
+}
+
+async function processBuyMessage(ctx) {
+  ctx.session ??= {};
+  const flow = ctx.session.buyFlow;
+  if (!flow) return false;
+
+  const rawText = ctx.message.text?.trim();
+  if (!rawText) {
+    await ctx.reply("Введите текстовое значение.");
+    return true;
+  }
+
+  if (flow.stage === "awaiting_symbol") {
+    const symbol = rawText.replace(/^\$/, "").trim();
+    if (!symbol) {
+      await ctx.reply("Введите символ токена, например PEPE или $PEPE.");
+      return true;
+    }
+    try {
+      const target = await getBuyTarget(symbol);
+      flow.targetToken = target;
+      flow.stage = "choose_payment";
+
+      const infoLines = formatTokenMetaInfo(target);
+      await ctx.reply(infoLines.join("\n"));
+
+      await ensureBuyPaymentTokens(flow);
+      const keyboard = makeBuyPaymentKeyboard(flow);
+      if (!keyboard) {
+        await ctx.reply(
+          "Не удалось найти токены в кошельке для оплаты. Пополните баланс и попробуйте снова."
+        );
+        resetBuyFlow(ctx);
+        return true;
+      }
+
+      const balanceLines = Object.values(flow.paymentTokens).map((token) => {
+        const amount = formatAmount(token.uiAmount);
+        const value = formatUsd(token.valueUsdt);
+        return `${token.symbol}: ${amount} (${value})`;
+      });
+      await ctx.reply(`Доступные токены в кошельке:\n${balanceLines.join("\n")}`);
+      await ctx.reply("Выберите токен, которым будете платить:", keyboard);
+    } catch (e) {
+      await ctx.reply("Не удалось получить данные о токене: " + e.message);
+    }
+    return true;
+  }
+
+  if (
+    flow.stage === "awaiting_amount" &&
+    flow.paymentToken &&
+    flow.targetToken
+  ) {
+    let amountRaw;
+    let amountUi;
+
+    if (rawText.toUpperCase() === "MAX") {
+      amountRaw = flow.paymentToken.rawAmount;
+      amountUi = Number(flow.paymentToken.uiAmount);
+    } else {
+      const normalized = rawText.replace(",", ".");
+      const parsed = Number(normalized);
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        await ctx.reply("Введите положительное число или MAX.");
+        return true;
+      }
+      try {
+        amountRaw = toRawAmount(parsed, flow.paymentToken.decimals);
+      } catch (e) {
+        await ctx.reply("Не удалось обработать количество: " + e.message);
+        return true;
+      }
+      amountUi = parsed;
+    }
+
+    if (BigInt(amountRaw) > BigInt(flow.paymentToken.rawAmount)) {
+      await ctx.reply("Недостаточно токенов на балансе.");
+      return true;
+    }
+
+    try {
+      const quote = await getSwapQuote({
+        inputMint: flow.paymentToken.mint,
+        outputMint: flow.targetToken.mint,
+        amount: amountRaw,
+      });
+      flow.quote = quote;
+      flow.stage = "awaiting_confirmation";
+      flow.amountUi = amountUi;
+      flow.amountRaw = amountRaw;
+
+      const lines = formatBuyQuotePreview(flow);
+      await ctx.reply(lines.join("\n"), {
+        reply_markup: Markup.inlineKeyboard([
+          [Markup.button.callback("✅ OK", "buy:confirm")],
+          [Markup.button.callback("✖️ Cancel", "buy:cancel")],
+        ]).reply_markup,
+      });
+    } catch (e) {
+      console.error("Buy quote error", e);
+      await ctx.reply("Не удалось получить котировку: " + e.message);
+    }
+    return true;
+  }
+
+  return false;
 }
 
 async function processSellAmount(ctx) {
@@ -499,6 +868,10 @@ bot.hears("Sell", async (ctx) => {
   await handleSellStart(ctx);
 });
 
+bot.hears("Buy", async (ctx) => {
+  await handleBuyStart(ctx);
+});
+
 bot.command("get", async (ctx) => {
   const s = await store.getAll();
   await ctx.replyWithMarkdown(
@@ -543,6 +916,10 @@ bot.on("callback_query", async (ctx) => {
       await handleSellCallback(ctx, data);
       return;
     }
+    if (data.startsWith("buy:")) {
+      await handleBuyCallback(ctx, data);
+      return;
+    }
     if (data.startsWith("num:")) {
       await handleNumericCallback(ctx, data.slice(4));
       return;
@@ -581,6 +958,9 @@ bot.on("callback_query", async (ctx) => {
 bot.on("message", async (ctx, next) => {
   if (!("text" in ctx.message)) return next();
   ctx.session ??= {};
+  if (await processBuyMessage(ctx)) {
+    return;
+  }
   if (await processSellAmount(ctx)) {
     return;
   }
