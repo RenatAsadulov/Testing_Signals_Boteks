@@ -586,7 +586,8 @@ const __PRICE_HEADERS =
         referer: "https://jup.ag/",
       };
 
-const { PRICE_HOST = "price.jup.ag", PRICE_IP } = process.env;
+const { PRICE_HOST = "price.jup.ag", PRICE_IP: PRICE_IP_ENV } = process.env;
+const PRICE_IP = PRICE_IP_ENV || JUPITER_IP || undefined;
 
 function __createPriceClient({ host = PRICE_HOST, ip = PRICE_IP } = {}) {
   if (ip) {
