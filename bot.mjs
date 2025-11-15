@@ -190,7 +190,7 @@ async function handleNumericCallback(ctx, action) {
 
 bot.start(async (ctx) => {
   await ctx.reply(
-    "Hello! Here you can config *token*, *amount* и минимальный market cap.",
+    "Hello! Here you can config *token*, *amount* и *market cap*.",
     {
       parse_mode: "Markdown",
     }
