@@ -40,7 +40,8 @@ function ensureConnection() {
 }
 
 function ensureWallet() {
-  if (!WALLET_SECRET_KEY) throw new Error("WALLET_SECRET_KEY is not configured");
+  if (!WALLET_SECRET_KEY)
+    throw new Error("WALLET_SECRET_KEY is not configured");
   if (!__wallet) {
     __wallet = keypairFromAny(WALLET_SECRET_KEY);
   }
@@ -247,7 +248,11 @@ async function fetchTokenMetadataMap(mints) {
         const match = (data || []).find((entry) => entry.id === mint);
         if (match) out[mint] = match;
       } catch (err) {
-        console.warn("Failed to fetch token metadata", mint, err?.message || err);
+        console.warn(
+          "Failed to fetch token metadata",
+          mint,
+          err?.message || err
+        );
       }
     })
   );
@@ -292,16 +297,14 @@ const numberFormatter = new Intl.NumberFormat("en-US", {
 });
 
 function formatNumber(value) {
-  return Number.isFinite(value)
-    ? numberFormatter.format(value)
-    : "unknown";
+  return Number.isFinite(value) ? numberFormatter.format(value) : "unknown";
 }
 
 function pickPriceValue(info) {
   if (!info || typeof info !== "object") return null;
   const candidates = [
     info.price,
-    info.priceUsd,
+    info.usdPrice,
     info.usd,
     info.value,
     info.priceInfo?.price,
@@ -431,7 +434,8 @@ export async function fetchWalletTokens({ vsToken = "USDT" } = {}) {
     const rawAmount = tokenAmount.amount;
     if (!rawAmount || rawAmount === "0") continue;
     const decimals = Number(tokenAmount.decimals ?? 0);
-    const uiAmountString = tokenAmount.uiAmountString || String(tokenAmount.uiAmount || 0);
+    const uiAmountString =
+      tokenAmount.uiAmountString || String(tokenAmount.uiAmount || 0);
     const uiAmount = Number(uiAmountString);
     if (!Number.isFinite(uiAmount) || uiAmount <= 0) continue;
     tokens.push({
@@ -473,10 +477,13 @@ export async function fetchWalletTokens({ vsToken = "USDT" } = {}) {
   fallbackVsTokens.push(null);
 
   try {
-    priceByMint = await getPricesByMint(consolidated.map((t) => t.mint), {
-      vsToken,
-      fallbackVsTokens,
-    });
+    priceByMint = await getPricesByMint(
+      consolidated.map((t) => t.mint),
+      {
+        vsToken,
+        fallbackVsTokens,
+      }
+    );
   } catch (e) {
     console.warn("Failed to load prices:", e.message);
   }
@@ -491,6 +498,7 @@ export async function fetchWalletTokens({ vsToken = "USDT" } = {}) {
   const enriched = consolidated.map((token) => {
     const price = priceByMint[token.mint] || null;
     const priceUsdt = pickPriceValue(price);
+    console.log("priceUsdt", priceUsdt, price);
     const valueUsdt =
       priceUsdt != null && Number.isFinite(priceUsdt)
         ? priceUsdt * Number(token.uiAmount)
@@ -613,7 +621,10 @@ const __PRICE_CLIENTS = __buildPriceClients();
 
 function __isRetriablePriceError(err) {
   if (!err) return false;
-  if (err.code && ["ECONNRESET", "ENOTFOUND", "ECONNREFUSED", "EAI_AGAIN"].includes(err.code)) {
+  if (
+    err.code &&
+    ["ECONNRESET", "ENOTFOUND", "ECONNREFUSED", "EAI_AGAIN"].includes(err.code)
+  ) {
     return true;
   }
   const status = err?.response?.status;
@@ -640,7 +651,9 @@ async function __requestPrice(path, params, { label, signal } = {}) {
         throw err;
       }
       console.warn(
-        `${label || path} failed on price client (${tag}); retrying with fallback:`,
+        `${
+          label || path
+        } failed on price client (${tag}); retrying with fallback:`,
         err?.message || err
       );
     }
@@ -784,15 +797,11 @@ export async function getPricesByMint(mintOrMints, opt = {}) {
       };
 
       try {
-        const { data } = await __requestPrice(
-          "/price/v3",
-          params,
-          {
-            label: `Price fetch vs ${vsCandidate || "default"}`,
-            signal: opt.signal,
-          }
-        );
-        const map = data?.data || {};
+        const { data } = await __requestPrice("/price/v3", params, {
+          label: `Price fetch vs ${vsCandidate || "default"}`,
+          signal: opt.signal,
+        });
+        const map = data || {};
         for (const id of chunk) {
           const info = map[id];
           if (info && !prices[id]) {
