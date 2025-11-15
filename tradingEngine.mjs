@@ -589,6 +589,7 @@ export function createTradingEngine({ store, notifier, logger } = {}) {
       client = null;
     }
     running = false;
+    await notifyAll("Trading engine stopped");
   }
 
   function isRunning() {

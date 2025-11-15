@@ -186,8 +186,9 @@ function makeMainMenuKeyboard() {
     .persistent();
 }
 
-function makeTradingMenuKeyboard() {
-  return Markup.keyboard([["Configuration"], ["Start trading"]])
+function makeTradingMenuKeyboard(isRunning = false) {
+  const actionLabel = isRunning ? "Stop trading" : "Start trading";
+  return Markup.keyboard([["Configuration"], [actionLabel]])
     .resize()
     .persistent();
 }
@@ -1272,7 +1273,7 @@ bot.hears("Statistics", async (ctx) => {
 bot.hears("Trade-Bot", async (ctx) => {
   await ctx.reply(
     "🧠 Trading bot controls:",
-    makeTradingMenuKeyboard()
+    makeTradingMenuKeyboard(tradingEngine.isRunning())
   );
 });
 
@@ -1285,18 +1286,44 @@ bot.hears("Start trading", async (ctx) => {
     const chatId = ctx.chat?.id ?? null;
     const result = await tradingEngine.start({ notifyChatId: chatId });
     if (result?.alreadyRunning) {
-      await ctx.reply("Trading engine уже запущен.", makeTradingMenuKeyboard());
+      await ctx.reply(
+        "Trading engine уже запущен.",
+        makeTradingMenuKeyboard(tradingEngine.isRunning())
+      );
     } else {
       await ctx.reply(
         "Trading engine started ✅",
-        makeTradingMenuKeyboard()
+        makeTradingMenuKeyboard(true)
       );
     }
   } catch (err) {
     console.error("Start trading error", err);
     await ctx.reply(
       "Не удалось запустить трейдинг: " + err.message,
-      makeTradingMenuKeyboard()
+      makeTradingMenuKeyboard(tradingEngine.isRunning())
+    );
+  }
+});
+
+bot.hears("Stop trading", async (ctx) => {
+  try {
+    if (!tradingEngine.isRunning()) {
+      await ctx.reply(
+        "Trading engine уже остановлен.",
+        makeTradingMenuKeyboard(false)
+      );
+      return;
+    }
+    await tradingEngine.stop();
+    await ctx.reply(
+      "Trading engine stopped ⛔",
+      makeTradingMenuKeyboard(false)
+    );
+  } catch (err) {
+    console.error("Stop trading error", err);
+    await ctx.reply(
+      "Не удалось остановить трейдинг: " + err.message,
+      makeTradingMenuKeyboard(tradingEngine.isRunning())
     );
   }
 });
@@ -1368,7 +1395,7 @@ bot.on("callback_query", async (ctx) => {
       }
       await ctx.reply(
         "🧠 Trading bot controls:",
-        makeTradingMenuKeyboard()
+        makeTradingMenuKeyboard(tradingEngine.isRunning())
       );
       return;
     }
