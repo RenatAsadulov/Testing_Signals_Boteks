@@ -785,7 +785,7 @@ export async function getPricesByMint(mintOrMints, opt = {}) {
 
       try {
         const { data } = await __requestPrice(
-          "/v3/price",
+          "/price/v3",
           params,
           {
             label: `Price fetch vs ${vsCandidate || "default"}`,
@@ -842,7 +842,7 @@ export async function getPriceChanges(mints, interval = "24h") {
   if (!ids.length) return {};
 
   const { data } = await __requestPrice(
-    "/v3/price-changes",
+    "/price/v3/price-changes",
     {
       ids: ids.join(","),
       interval,
