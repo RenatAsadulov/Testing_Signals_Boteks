@@ -1,7 +1,6 @@
 import "dotenv/config";
 import { Telegraf, Markup, session } from "telegraf";
 import { Store } from "./store.mjs";
-import path from "node:path";
 import { recordWalletSnapshot } from "./walletStatistics.mjs";
 import {
   initMongo,
@@ -165,7 +164,6 @@ function makeKeyboard(settings) {
     [Markup.button.callback(currencyLabel, "edit:token")],
     [Markup.button.callback(profitTargetLabel, "edit:profitTargetPercent")],
     [Markup.button.callback(amountLabel, "edit:amount")],
-    [Markup.button.callback("📤 Export JSON", "export")],
   ];
   return Markup.inlineKeyboard(rows);
 }
@@ -1309,14 +1307,6 @@ bot.on("callback_query", async (ctx) => {
     }
     if (data.startsWith("num:")) {
       await handleNumericCallback(ctx, data.slice(4));
-      return;
-    }
-    if (data === "export") {
-      await ctx.answerCbQuery();
-      await ctx.replyWithDocument({
-        source: path.resolve(SETTINGS_FILE),
-        filename: "settings.json",
-      });
       return;
     }
     if (!data.startsWith("edit:")) return;
