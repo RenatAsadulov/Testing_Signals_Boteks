@@ -172,6 +172,7 @@ function makeKeyboard(settings) {
     [Markup.button.callback(currencyLabel, "edit:token")],
     [Markup.button.callback(profitTargetLabel, "edit:profitTargetPercent")],
     [Markup.button.callback(amountLabel, "edit:amount")],
+    [Markup.button.callback("⬅️ Back", "settings:back")],
   ];
   return Markup.inlineKeyboard(rows);
 }
@@ -1356,6 +1357,21 @@ bot.command("set", async (ctx) => {
 bot.on("callback_query", async (ctx) => {
   try {
     const data = ctx.callbackQuery.data || "";
+    if (data === "settings:back") {
+      await ctx.answerCbQuery();
+      try {
+        await ctx.editMessageReplyMarkup();
+      } catch (err) {
+        if (err?.response?.error_code !== 400) {
+          console.warn("Failed to clear settings keyboard:", err);
+        }
+      }
+      await ctx.reply(
+        "🧠 Trading bot controls:",
+        makeTradingMenuKeyboard()
+      );
+      return;
+    }
     if (data.startsWith("sell:")) {
       await handleSellCallback(ctx, data);
       return;
