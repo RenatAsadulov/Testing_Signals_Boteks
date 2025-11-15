@@ -4,6 +4,15 @@ import { Store } from "./store.mjs";
 import path from "node:path";
 import { recordWalletSnapshot } from "./walletStatistics.mjs";
 import {
+  initMongo,
+  logUserAction,
+  mongoConfigured,
+  mongoIsActive,
+  saveSettingsDocument,
+  updateTokenAggregates,
+  updateWalletAggregate,
+} from "./mongoClient.mjs";
+import {
   executeSwapQuote,
   fetchWalletTokens,
   getSwapQuote,
@@ -29,9 +38,170 @@ const store = new Store(SETTINGS_FILE, {
 });
 await store.load();
 
+const mongoReady = await initMongo();
+if (!mongoReady) {
+  if (mongoConfigured) {
+    console.error(
+      "MongoDB connection failed. Telemetry and analytics have been disabled."
+    );
+  } else {
+    console.warn(
+      "MongoDB is not configured. Telemetry and analytics will be skipped."
+    );
+  }
+} else {
+  await syncSettingsSnapshot("startup");
+}
+
 const bot = new Telegraf(BOT_TOKEN);
 
 bot.use(session());
+bot.use(async (ctx, next) => {
+  if (ctx?.from) {
+    await recordAction(ctx, `update:${ctx.updateType || "unknown"}`, {
+      updateId: ctx.update?.update_id,
+    });
+  }
+  return next();
+});
+
+function getUserContext(ctx) {
+  const from = ctx?.from;
+  if (!from) return null;
+  return {
+    id: from.id,
+    isBot: from.is_bot ?? undefined,
+    username: from.username || null,
+    firstName: from.first_name || null,
+    lastName: from.last_name || null,
+    languageCode: from.language_code || null,
+  };
+}
+
+function getChatContext(ctx) {
+  const chat = ctx?.chat;
+  if (!chat) return null;
+  return {
+    id: chat.id,
+    type: chat.type,
+    title: chat.title || null,
+    username: chat.username || null,
+  };
+}
+
+async function recordAction(ctx, action, details = {}) {
+  if (!mongoIsActive()) return;
+  try {
+    await logUserAction({
+      action,
+      details,
+      user: getUserContext(ctx),
+      chat: getChatContext(ctx),
+      message: ctx?.message
+        ? {
+            id: ctx.message.message_id,
+            text:
+              typeof ctx.message.text === "string"
+                ? ctx.message.text.slice(0, 4096)
+                : undefined,
+            viaBot: ctx.message.via_bot?.id,
+          }
+        : null,
+      callbackQuery: ctx?.callbackQuery
+        ? {
+            id: ctx.callbackQuery.id,
+            data: ctx.callbackQuery.data
+              ? String(ctx.callbackQuery.data).slice(0, 1024)
+              : undefined,
+          }
+        : null,
+      createdAt: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error("Failed to log user action:", err);
+  }
+}
+
+async function syncSettingsSnapshot(reason, ctx) {
+  if (!mongoIsActive()) return;
+  try {
+    const settings = await store.getAll();
+    await saveSettingsDocument(settings, {
+      reason,
+      user: getUserContext(ctx),
+      at: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error("Failed to sync settings to MongoDB:", err);
+  }
+}
+
+function normalizeTokenForAggregate(token) {
+  const symbol =
+    token?.symbol || token?.name || (token?.mint ? token.mint.slice(0, 6) : null);
+  const uiAmount = Number(token?.uiAmount);
+  const valueUsdt = Number(token?.valueUsdt);
+  const priceUsdt = Number(token?.priceUsdt);
+  return {
+    mint: token?.mint || null,
+    symbol,
+    uiAmount: Number.isFinite(uiAmount) ? uiAmount : null,
+    valueUsdt: Number.isFinite(valueUsdt) ? valueUsdt : null,
+    priceUsdt: Number.isFinite(priceUsdt) ? priceUsdt : null,
+    decimals: Number.isFinite(token?.decimals) ? Number(token.decimals) : null,
+  };
+}
+
+async function updateWalletFromTokens(tokensRaw, context = {}) {
+  if (!mongoIsActive()) return;
+  try {
+    const normalized = Array.isArray(tokensRaw)
+      ? tokensRaw.map((token) => normalizeTokenForAggregate(token))
+      : [];
+    const totalValue = normalized.reduce((sum, token) => {
+      return Number.isFinite(token.valueUsdt) ? sum + token.valueUsdt : sum;
+    }, 0);
+    await updateWalletAggregate({
+      tokens: normalized,
+      totalValue,
+      context: {
+        ...context,
+        updatedAt: new Date().toISOString(),
+      },
+    });
+  } catch (err) {
+    console.error("Failed to update wallet aggregate:", err);
+  }
+}
+
+async function refreshWalletState(ctx, reason) {
+  try {
+    const tokensRaw = await fetchWalletTokens({ vsToken: SELL_PRICE_VS });
+    await updateWalletFromTokens(tokensRaw, {
+      reason,
+      user: getUserContext(ctx),
+    });
+  } catch (err) {
+    console.error("Failed to refresh wallet state:", err);
+  }
+}
+
+async function trackTokenAction(ctx, payload) {
+  if (!mongoIsActive()) return;
+  if (!payload || !payload.tokenMint) return;
+  try {
+    const context = {
+      ...(payload.context || {}),
+      user: getUserContext(ctx),
+    };
+    await updateTokenAggregates({
+      ...payload,
+      context,
+    });
+  } catch (err) {
+    console.error("Failed to update token aggregates:", err);
+  }
+}
 
 function makeKeyboard(settings) {
   const rows = [
@@ -270,6 +440,10 @@ async function handleSellStart(ctx) {
   resetSellFlow(ctx);
   try {
     const tokensRaw = await fetchWalletTokens({ vsToken: SELL_PRICE_VS });
+    await updateWalletFromTokens(tokensRaw, {
+      reason: "sell:start",
+      user: getUserContext(ctx),
+    });
     const tokens = tokensRaw.filter((token) =>
       Number.isFinite(token?.priceUsdt)
     );
@@ -332,9 +506,13 @@ async function handleBuyStart(ctx) {
   }
 }
 
-async function ensureBuyPaymentTokens(flow) {
+async function ensureBuyPaymentTokens(flow, ctx) {
   if (flow.paymentTokens) return flow.paymentTokens;
   const tokensRaw = await fetchWalletTokens();
+  await updateWalletFromTokens(tokensRaw, {
+    reason: "buy:payment-tokens",
+    user: getUserContext(ctx),
+  });
   const tokenMap = {};
   for (const token of tokensRaw) {
     const symbol = token.symbol || token.name || token.mint.slice(0, 6);
@@ -407,6 +585,10 @@ async function handleSellCallback(ctx, data) {
   const action = parts[1];
   const payload = parts.slice(2).join(":");
 
+  await recordAction(ctx, `buy:${action}`, { payload });
+
+  await recordAction(ctx, `sell:${action}`, { payload });
+
   if (action === "token") {
     const token = flow.tokens?.[payload];
     if (!token) {
@@ -419,6 +601,11 @@ async function handleSellCallback(ctx, data) {
       );
       return;
     }
+    await recordAction(ctx, "sell:token:selected", {
+      mint: token.mint,
+      symbol: token.symbol,
+      valueUsdt: token.valueUsdt,
+    });
     flow.selectedToken = token;
     flow.stage = "chooseTarget";
     const buttons = [
@@ -441,6 +628,10 @@ async function handleSellCallback(ctx, data) {
     const targetSymbol = payload.toUpperCase();
     try {
       flow.target = await getSellTarget(targetSymbol);
+      await recordAction(ctx, "sell:target:selected", {
+        targetSymbol: flow.target.symbol,
+        targetMint: flow.target.mint,
+      });
     } catch (e) {
       await ctx.reply("Не удалось подготовить целевой токен: " + e.message);
       return;
@@ -465,6 +656,40 @@ async function handleSellCallback(ctx, data) {
       await ctx.reply(
         `Сделка выполнена!\nСсылка: https://solscan.io/tx/${sig}`
       );
+      const amountUiNumber = Number(flow.amountUi);
+      const estimatedValueUsd =
+        Number.isFinite(flow.selectedToken?.priceUsdt) &&
+        Number.isFinite(amountUiNumber)
+          ? Number(flow.selectedToken.priceUsdt) * amountUiNumber
+          : null;
+      const outAmountUi =
+        flow.quote?.outAmount && flow.target?.decimals != null
+          ? Number(flow.quote.outAmount) / 10 ** flow.target.decimals
+          : null;
+      await Promise.allSettled([
+        recordAction(ctx, "sell:confirm:success", {
+          transactionSignature: sig,
+          tokenMint: flow.selectedToken?.mint,
+          tokenSymbol: flow.selectedToken?.symbol,
+          amountUi: Number.isFinite(amountUiNumber) ? amountUiNumber : null,
+          amountOutUi: Number.isFinite(outAmountUi) ? outAmountUi : null,
+          targetSymbol: flow.target?.symbol,
+        }),
+        trackTokenAction(ctx, {
+          tokenMint: flow.selectedToken?.mint,
+          tokenSymbol: flow.selectedToken?.symbol,
+          actionType: "sell",
+          amountUi: amountUiNumber,
+          valueUsd: estimatedValueUsd,
+          context: {
+            targetMint: flow.target?.mint,
+            targetSymbol: flow.target?.symbol,
+            transactionSignature: sig,
+            amountOutUi: Number.isFinite(outAmountUi) ? outAmountUi : null,
+          },
+        }),
+        refreshWalletState(ctx, "sell:executed"),
+      ]);
     } catch (e) {
       console.error("Sell execution error", e);
       await ctx.reply(
@@ -499,13 +724,15 @@ async function handleBuyCallback(ctx, data) {
   const action = parts[1];
   const payload = parts.slice(2).join(":");
 
+  await recordAction(ctx, `buy:${action}`, { payload });
+
   if (action === "pay") {
     if (!flow.targetToken) {
       await ctx.reply("Сначала выберите токен для покупки.");
       return;
     }
     try {
-      await ensureBuyPaymentTokens(flow);
+      await ensureBuyPaymentTokens(flow, ctx);
     } catch (e) {
       await ctx.reply("Не удалось загрузить список токенов: " + e.message);
       return;
@@ -516,6 +743,11 @@ async function handleBuyCallback(ctx, data) {
       return;
     }
     flow.paymentToken = token;
+    await recordAction(ctx, "buy:payment-selected", {
+      mint: token.mint,
+      symbol: token.symbol,
+      balance: token.uiAmount,
+    });
     flow.stage = "awaiting_amount";
     const availableAmount = formatAmount(token.uiAmount);
     const availableValue = formatUsd(token.valueUsdt);
@@ -536,6 +768,58 @@ async function handleBuyCallback(ctx, data) {
       await ctx.reply(
         `Сделка выполнена!\nСсылка: https://solscan.io/tx/${sig}`
       );
+      const paymentAmountUi = Number(flow.amountUi);
+      const paymentValueUsd =
+        Number.isFinite(flow.paymentToken?.priceUsdt) &&
+        Number.isFinite(paymentAmountUi)
+          ? Number(flow.paymentToken.priceUsdt) * paymentAmountUi
+          : null;
+      const receivedAmountUi =
+        flow.quote?.outAmount && flow.targetToken?.decimals != null
+          ? Number(flow.quote.outAmount) / 10 ** flow.targetToken.decimals
+          : null;
+      await Promise.allSettled([
+        recordAction(ctx, "buy:confirm:success", {
+          transactionSignature: sig,
+          paymentMint: flow.paymentToken?.mint,
+          paymentSymbol: flow.paymentToken?.symbol,
+          paymentAmountUi: Number.isFinite(paymentAmountUi)
+            ? paymentAmountUi
+            : null,
+          receivedAmountUi: Number.isFinite(receivedAmountUi)
+            ? receivedAmountUi
+            : null,
+          targetSymbol: flow.targetToken?.symbol,
+        }),
+        trackTokenAction(ctx, {
+          tokenMint: flow.targetToken?.mint,
+          tokenSymbol: flow.targetToken?.symbol,
+          actionType: "buy",
+          amountUi: receivedAmountUi,
+          valueUsd: paymentValueUsd,
+          context: {
+            paymentMint: flow.paymentToken?.mint,
+            paymentSymbol: flow.paymentToken?.symbol,
+            paymentAmountUi: Number.isFinite(paymentAmountUi)
+              ? paymentAmountUi
+              : null,
+            transactionSignature: sig,
+          },
+        }),
+        trackTokenAction(ctx, {
+          tokenMint: flow.paymentToken?.mint,
+          tokenSymbol: flow.paymentToken?.symbol,
+          actionType: "spend",
+          amountUi: paymentAmountUi,
+          valueUsd: paymentValueUsd,
+          context: {
+            targetMint: flow.targetToken?.mint,
+            targetSymbol: flow.targetToken?.symbol,
+            transactionSignature: sig,
+          },
+        }),
+        refreshWalletState(ctx, "buy:executed"),
+      ]);
     } catch (e) {
       console.error("Buy execution error", e);
       await ctx.reply(
@@ -574,6 +858,7 @@ async function processBuyMessage(ctx) {
       await ctx.reply("Введите символ токена, например PEPE или $PEPE.");
       return true;
     }
+    await recordAction(ctx, "buy:symbol", { symbol });
     try {
       const target = await getBuyTarget(symbol);
       flow.targetToken = target;
@@ -582,7 +867,7 @@ async function processBuyMessage(ctx) {
       const infoLines = formatTokenMetaInfo(target);
       await ctx.reply(infoLines.join("\n"));
 
-      await ensureBuyPaymentTokens(flow);
+      await ensureBuyPaymentTokens(flow, ctx);
       const keyboard = makeBuyPaymentKeyboard(flow);
       if (!keyboard) {
         await ctx.reply(
@@ -636,6 +921,11 @@ async function processBuyMessage(ctx) {
       await ctx.reply("Недостаточно токенов на балансе.");
       return true;
     }
+
+    await recordAction(ctx, "buy:amount", {
+      amountUi,
+      rawText,
+    });
 
     try {
       const quote = await getSwapQuote({
@@ -710,6 +1000,11 @@ async function processSellAmount(ctx) {
     return true;
   }
 
+  await recordAction(ctx, "sell:amount", {
+    amountUi,
+    rawText,
+  });
+
   try {
     const quote = await getSwapQuote({
       inputMint: flow.selectedToken.mint,
@@ -727,9 +1022,23 @@ async function processSellAmount(ctx) {
     const minOut = quote?.otherAmountThreshold
       ? Number(quote.otherAmountThreshold) / 10 ** flow.target.decimals
       : null;
-    const priceImpact = quote?.priceImpactPct
-      ? Number(quote.priceImpactPct) * 100
-      : null;
+      const priceImpact = quote?.priceImpactPct
+        ? Number(quote.priceImpactPct) * 100
+        : null;
+
+      await recordAction(ctx, "buy:quote", {
+        amountUi,
+        outAmount,
+        minOut,
+        priceImpact,
+      });
+
+    await recordAction(ctx, "sell:quote", {
+      amountUi,
+      outAmount,
+      minOut,
+      priceImpact,
+    });
 
     const lines = [
       "Предпросмотр сделки",
@@ -775,18 +1084,20 @@ const NUMERIC_EDIT_FIELDS = {
   amount: {
     title: "Swap amount",
     toDisplay: (value) => String(value ?? 0),
-    async persist(raw) {
+    async persist(raw, ctx) {
       const n = Number(raw || 0);
       await store.setAmount(n);
+      await syncSettingsSnapshot("update:amount", ctx);
       return n;
     },
   },
   marketCapMinimum: {
     title: "Minimum market cap",
     toDisplay: (value) => String(value ?? 0),
-    async persist(raw) {
+    async persist(raw, ctx) {
       const n = Number(raw || 0);
       await store.setMarketCapMinimum(n);
+      await syncSettingsSnapshot("update:marketCapMinimum", ctx);
       return n;
     },
   },
@@ -830,6 +1141,7 @@ function numericPromptText(field, value) {
 
 async function beginNumericEdit(ctx, field) {
   const info = NUMERIC_EDIT_FIELDS[field];
+  await recordAction(ctx, "settings:edit:start", { field });
   const s = await store.getAll();
   const initial = info.toDisplay(s[field]);
   ctx.session ??= {};
@@ -856,6 +1168,10 @@ async function handleNumericCallback(ctx, action) {
   if (!edit) return;
   const message = ctx.callbackQuery.message;
   if (!message || message.message_id !== edit.messageId) return;
+  await recordAction(ctx, `settings:edit:${action}`, {
+    field: edit.field,
+    buffer: edit.buffer,
+  });
   if (action === "cancel") {
     ctx.session.numericEdit = null;
     await ctx.editMessageText("Отменено").catch(() => {});
@@ -872,7 +1188,7 @@ async function handleNumericCallback(ctx, action) {
   } else if (action === "save") {
     try {
       const info = NUMERIC_EDIT_FIELDS[edit.field];
-      const persisted = await info.persist(edit.buffer);
+      const persisted = await info.persist(edit.buffer, ctx);
       ctx.session.numericEdit = null;
       await ctx.editMessageText(`Сохранено: ${info.title} = ${persisted}`, {
         parse_mode: "Markdown",
@@ -897,6 +1213,7 @@ async function handleNumericCallback(ctx, action) {
 }
 
 bot.start(async (ctx) => {
+  await recordAction(ctx, "command:start");
   await ctx.reply(
     "Hello! Here you can config *token*, *amount* и *market cap*.", // TODO update text
     {
@@ -907,21 +1224,29 @@ bot.start(async (ctx) => {
 });
 
 bot.command("settings", async (ctx) => {
+  await recordAction(ctx, "command:settings");
   await replyWithSettings(ctx);
 });
 
 bot.hears("Sell", async (ctx) => {
+  await recordAction(ctx, "menu:sell");
   await handleSellStart(ctx);
 });
 
 bot.hears("Buy", async (ctx) => {
+  await recordAction(ctx, "menu:buy");
   await handleBuyStart(ctx);
 });
 
 bot.hears("Statistics", async (ctx) => {
+  await recordAction(ctx, "menu:statistics");
   try {
     await ctx.sendChatAction?.("typing");
     const tokensRaw = await fetchWalletTokens({ vsToken: SELL_PRICE_VS });
+    await updateWalletFromTokens(tokensRaw, {
+      reason: "statistics",
+      user: getUserContext(ctx),
+    });
     if (!tokensRaw.length) {
       await ctx.reply("В кошельке нет токенов для отображения статистики.");
       return;
@@ -1022,6 +1347,7 @@ bot.hears("Statistics", async (ctx) => {
 });
 
 bot.command("get", async (ctx) => {
+  await recordAction(ctx, "command:get");
   const s = await store.getAll();
   await ctx.replyWithMarkdown(
     `\- token: \`${s.token}\`\n` +
@@ -1031,6 +1357,9 @@ bot.command("get", async (ctx) => {
 });
 
 bot.command("set", async (ctx) => {
+  await recordAction(ctx, "command:set", {
+    text: ctx.message?.text,
+  });
   try {
     // assertOwner(ctx);
     const [, key, ...rest] = (ctx.message.text || "").split(/\s+/);
@@ -1038,16 +1367,22 @@ bot.command("set", async (ctx) => {
     if (!key || !value)
       return ctx.reply("Use: /set <token|amount|marketCapMinimum> <value>");
     if (key === "token") {
+      await recordAction(ctx, "command:set:token", { value });
       await store.setToken(value);
+      await syncSettingsSnapshot("update:token", ctx);
     } else if (key === "amount") {
       const n = Number(value);
       if (!Number.isFinite(n)) return ctx.reply("amount should be a number");
+      await recordAction(ctx, "command:set:amount", { value: n });
       await store.setAmount(n);
+      await syncSettingsSnapshot("update:amount", ctx);
     } else if (key === "marketCapMinimum") {
       const n = Number(value);
       if (!Number.isFinite(n) || n < 0)
         return ctx.reply("marketCapMinimum should be a non-negative number");
+      await recordAction(ctx, "command:set:marketCapMinimum", { value: n });
       await store.setMarketCapMinimum(n);
+      await syncSettingsSnapshot("update:marketCapMinimum", ctx);
     } else {
       return ctx.reply("Available keys: token, amount, marketCapMinimum");
     }
@@ -1074,6 +1409,7 @@ bot.on("callback_query", async (ctx) => {
       return;
     }
     if (data === "export") {
+      await recordAction(ctx, "callback:export");
       await ctx.answerCbQuery();
       await ctx.replyWithDocument({
         source: path.resolve(SETTINGS_FILE),
@@ -1083,6 +1419,7 @@ bot.on("callback_query", async (ctx) => {
     }
     if (!data.startsWith("edit:")) return;
     const key = data.split(":")[1];
+    await recordAction(ctx, "callback:edit", { key });
     if (NUMERIC_EDIT_FIELDS[key]) {
       await ctx.answerCbQuery();
       await beginNumericEdit(ctx, key);
@@ -1118,7 +1455,9 @@ bot.on("message", async (ctx, next) => {
   try {
     const raw = ctx.message.text.trim();
     if (key === "token") {
+      await recordAction(ctx, "settings:token:set", { value: raw });
       await store.setToken(raw);
+      await syncSettingsSnapshot("update:token", ctx);
     }
     ctx.session.editKey = null;
     await ctx.reply("Saved ✅");
