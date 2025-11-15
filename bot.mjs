@@ -114,9 +114,14 @@ async function handleSellStart(ctx) {
   ctx.session ??= {};
   resetSellFlow(ctx);
   try {
-    const tokens = await fetchWalletTokens({ vsToken: SELL_PRICE_VS });
+    const tokensRaw = await fetchWalletTokens({ vsToken: SELL_PRICE_VS });
+    const tokens = tokensRaw.filter((token) =>
+      Number.isFinite(token?.priceUsdt)
+    );
     if (!tokens.length) {
-      await ctx.reply("В кошельке нет токенов для продажи.");
+      await ctx.reply(
+        "В кошельке нет токенов с доступной ценой для продажи."
+      );
       return;
     }
 
@@ -173,6 +178,12 @@ async function handleSellCallback(ctx, data) {
     const token = flow.tokens?.[payload];
     if (!token) {
       await ctx.reply("Не удалось определить токен. Попробуйте снова начать процесс.");
+      return;
+    }
+    if (!Number.isFinite(token.priceUsdt)) {
+      await ctx.reply(
+        "Для этого токена нет данных о цене. Повторите попытку позже или выберите другой токен."
+      );
       return;
     }
     flow.selectedToken = token;
