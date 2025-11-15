@@ -2,6 +2,15 @@ import "dotenv/config";
 import { Telegraf, Markup, session } from "telegraf";
 import { Store } from "./store.mjs";
 import path from "node:path";
+import { recordWalletSnapshot } from "./walletStatistics.mjs";
+import {
+  initMongo,
+  mongoConfigured,
+  mongoIsActive,
+  saveSettingsDocument,
+  updateTokenAggregates,
+  updateWalletAggregate,
+} from "./mongoClient.mjs";
 import {
   executeSwapQuote,
   fetchWalletTokens,
@@ -13,6 +22,8 @@ import {
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const OWNER_ID = process.env.OWNER_ID ? Number(process.env.OWNER_ID) : null;
 const SETTINGS_FILE = process.env.SETTINGS_FILE || "./data/settings.json";
+const STATISTICS_FILE =
+  process.env.STATISTICS_FILE || "./data/wallet-statistics.json";
 
 if (!BOT_TOKEN) {
   console.error("Please set BOT_TOKEN in .env");
@@ -26,9 +37,118 @@ const store = new Store(SETTINGS_FILE, {
 });
 await store.load();
 
+const mongoReady = await initMongo();
+if (!mongoReady) {
+  if (mongoConfigured) {
+    console.error(
+      "MongoDB connection failed. Telemetry and analytics have been disabled."
+    );
+  } else {
+    console.warn(
+      "MongoDB is not configured. Telemetry and analytics will be skipped."
+    );
+  }
+} else {
+  await syncSettingsSnapshot("startup");
+}
+
 const bot = new Telegraf(BOT_TOKEN);
 
 bot.use(session());
+
+function getUserContext(ctx) {
+  const from = ctx?.from;
+  if (!from) return null;
+  return {
+    id: from.id,
+    isBot: from.is_bot ?? undefined,
+    username: from.username || null,
+    firstName: from.first_name || null,
+    lastName: from.last_name || null,
+    languageCode: from.language_code || null,
+  };
+}
+
+async function syncSettingsSnapshot(reason, ctx) {
+  if (!mongoIsActive()) return;
+  try {
+    const settings = await store.getAll();
+    await saveSettingsDocument(settings, {
+      reason,
+      user: getUserContext(ctx),
+      at: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error("Failed to sync settings to MongoDB:", err);
+  }
+}
+
+function normalizeTokenForAggregate(token) {
+  const symbol =
+    token?.symbol || token?.name || (token?.mint ? token.mint.slice(0, 6) : null);
+  const uiAmount = Number(token?.uiAmount);
+  const valueUsdt = Number(token?.valueUsdt);
+  const priceUsdt = Number(token?.priceUsdt);
+  return {
+    mint: token?.mint || null,
+    symbol,
+    uiAmount: Number.isFinite(uiAmount) ? uiAmount : null,
+    valueUsdt: Number.isFinite(valueUsdt) ? valueUsdt : null,
+    priceUsdt: Number.isFinite(priceUsdt) ? priceUsdt : null,
+    decimals: Number.isFinite(token?.decimals) ? Number(token.decimals) : null,
+  };
+}
+
+async function updateWalletFromTokens(tokensRaw, context = {}) {
+  if (!mongoIsActive()) return;
+  try {
+    const normalized = Array.isArray(tokensRaw)
+      ? tokensRaw.map((token) => normalizeTokenForAggregate(token))
+      : [];
+    const totalValue = normalized.reduce((sum, token) => {
+      return Number.isFinite(token.valueUsdt) ? sum + token.valueUsdt : sum;
+    }, 0);
+    await updateWalletAggregate({
+      tokens: normalized,
+      totalValue,
+      context: {
+        ...context,
+        updatedAt: new Date().toISOString(),
+      },
+    });
+  } catch (err) {
+    console.error("Failed to update wallet aggregate:", err);
+  }
+}
+
+async function refreshWalletState(ctx, reason) {
+  try {
+    const tokensRaw = await fetchWalletTokens({ vsToken: SELL_PRICE_VS });
+    await updateWalletFromTokens(tokensRaw, {
+      reason,
+      user: getUserContext(ctx),
+    });
+  } catch (err) {
+    console.error("Failed to refresh wallet state:", err);
+  }
+}
+
+async function trackTokenAction(ctx, payload) {
+  if (!mongoIsActive()) return;
+  if (!payload || !payload.tokenMint) return;
+  try {
+    const context = {
+      ...(payload.context || {}),
+      user: getUserContext(ctx),
+    };
+    await updateTokenAggregates({
+      ...payload,
+      context,
+    });
+  } catch (err) {
+    console.error("Failed to update token aggregates:", err);
+  }
+}
 
 function makeKeyboard(settings) {
   const rows = [
@@ -93,6 +213,43 @@ function formatUsdDetailed(value) {
   if (!Number.isFinite(value)) return "неизвестно";
   if (Math.abs(value) >= 1) return formatUsd(value);
   return `≈$${Number(value).toPrecision(4)}`;
+}
+
+function formatDateKey(date) {
+  const d = date instanceof Date ? date : new Date(date || Date.now());
+  return d.toISOString().slice(0, 10);
+}
+
+function formatDateHuman(dateKey) {
+  const date = new Date(`${dateKey}T00:00:00Z`);
+  if (Number.isNaN(date.getTime())) return dateKey;
+  return new Intl.DateTimeFormat("ru-RU", {
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+  }).format(date);
+}
+
+function formatUsdChange(diff) {
+  const sign = diff >= 0 ? "+" : "-";
+  return `${sign}${formatUsdDetailed(Math.abs(diff))}`;
+}
+
+function formatChangeLine({ label, currentValue, referenceEntry }) {
+  if (!Number.isFinite(currentValue)) return null;
+  if (!referenceEntry || !Number.isFinite(referenceEntry.totalValue)) return null;
+  const diff = currentValue - Number(referenceEntry.totalValue);
+  const percent =
+    Number(referenceEntry.totalValue) !== 0
+      ? (diff / Number(referenceEntry.totalValue)) * 100
+      : null;
+  const parts = [`${label}: ${formatUsdChange(diff)}`];
+  if (Number.isFinite(percent)) {
+    const sign = diff >= 0 ? "+" : "-";
+    parts.push(`(${sign}${Math.abs(percent).toFixed(2)}%)`);
+  }
+  parts.push(`(с ${formatDateHuman(referenceEntry.date)})`);
+  return parts.join(" ");
 }
 
 function pickMetaNumber(meta, keys) {
@@ -230,6 +387,10 @@ async function handleSellStart(ctx) {
   resetSellFlow(ctx);
   try {
     const tokensRaw = await fetchWalletTokens({ vsToken: SELL_PRICE_VS });
+    await updateWalletFromTokens(tokensRaw, {
+      reason: "sell:start",
+      user: getUserContext(ctx),
+    });
     const tokens = tokensRaw.filter((token) =>
       Number.isFinite(token?.priceUsdt)
     );
@@ -292,9 +453,13 @@ async function handleBuyStart(ctx) {
   }
 }
 
-async function ensureBuyPaymentTokens(flow) {
+async function ensureBuyPaymentTokens(flow, ctx) {
   if (flow.paymentTokens) return flow.paymentTokens;
   const tokensRaw = await fetchWalletTokens();
+  await updateWalletFromTokens(tokensRaw, {
+    reason: "buy:payment-tokens",
+    user: getUserContext(ctx),
+  });
   const tokenMap = {};
   for (const token of tokensRaw) {
     const symbol = token.symbol || token.name || token.mint.slice(0, 6);
@@ -425,6 +590,32 @@ async function handleSellCallback(ctx, data) {
       await ctx.reply(
         `Сделка выполнена!\nСсылка: https://solscan.io/tx/${sig}`
       );
+      const amountUiNumber = Number(flow.amountUi);
+      const estimatedValueUsd =
+        Number.isFinite(flow.selectedToken?.priceUsdt) &&
+        Number.isFinite(amountUiNumber)
+          ? Number(flow.selectedToken.priceUsdt) * amountUiNumber
+          : null;
+      const outAmountUi =
+        flow.quote?.outAmount && flow.target?.decimals != null
+          ? Number(flow.quote.outAmount) / 10 ** flow.target.decimals
+          : null;
+      await Promise.allSettled([
+        trackTokenAction(ctx, {
+          tokenMint: flow.selectedToken?.mint,
+          tokenSymbol: flow.selectedToken?.symbol,
+          actionType: "sell",
+          amountUi: amountUiNumber,
+          valueUsd: estimatedValueUsd,
+          context: {
+            targetMint: flow.target?.mint,
+            targetSymbol: flow.target?.symbol,
+            transactionSignature: sig,
+            amountOutUi: Number.isFinite(outAmountUi) ? outAmountUi : null,
+          },
+        }),
+        refreshWalletState(ctx, "sell:executed"),
+      ]);
     } catch (e) {
       console.error("Sell execution error", e);
       await ctx.reply(
@@ -465,7 +656,7 @@ async function handleBuyCallback(ctx, data) {
       return;
     }
     try {
-      await ensureBuyPaymentTokens(flow);
+      await ensureBuyPaymentTokens(flow, ctx);
     } catch (e) {
       await ctx.reply("Не удалось загрузить список токенов: " + e.message);
       return;
@@ -496,6 +687,46 @@ async function handleBuyCallback(ctx, data) {
       await ctx.reply(
         `Сделка выполнена!\nСсылка: https://solscan.io/tx/${sig}`
       );
+      const paymentAmountUi = Number(flow.amountUi);
+      const paymentValueUsd =
+        Number.isFinite(flow.paymentToken?.priceUsdt) &&
+        Number.isFinite(paymentAmountUi)
+          ? Number(flow.paymentToken.priceUsdt) * paymentAmountUi
+          : null;
+      const receivedAmountUi =
+        flow.quote?.outAmount && flow.targetToken?.decimals != null
+          ? Number(flow.quote.outAmount) / 10 ** flow.targetToken.decimals
+          : null;
+      await Promise.allSettled([
+        trackTokenAction(ctx, {
+          tokenMint: flow.targetToken?.mint,
+          tokenSymbol: flow.targetToken?.symbol,
+          actionType: "buy",
+          amountUi: receivedAmountUi,
+          valueUsd: paymentValueUsd,
+          context: {
+            paymentMint: flow.paymentToken?.mint,
+            paymentSymbol: flow.paymentToken?.symbol,
+            paymentAmountUi: Number.isFinite(paymentAmountUi)
+              ? paymentAmountUi
+              : null,
+            transactionSignature: sig,
+          },
+        }),
+        trackTokenAction(ctx, {
+          tokenMint: flow.paymentToken?.mint,
+          tokenSymbol: flow.paymentToken?.symbol,
+          actionType: "spend",
+          amountUi: paymentAmountUi,
+          valueUsd: paymentValueUsd,
+          context: {
+            targetMint: flow.targetToken?.mint,
+            targetSymbol: flow.targetToken?.symbol,
+            transactionSignature: sig,
+          },
+        }),
+        refreshWalletState(ctx, "buy:executed"),
+      ]);
     } catch (e) {
       console.error("Buy execution error", e);
       await ctx.reply(
@@ -542,7 +773,7 @@ async function processBuyMessage(ctx) {
       const infoLines = formatTokenMetaInfo(target);
       await ctx.reply(infoLines.join("\n"));
 
-      await ensureBuyPaymentTokens(flow);
+      await ensureBuyPaymentTokens(flow, ctx);
       const keyboard = makeBuyPaymentKeyboard(flow);
       if (!keyboard) {
         await ctx.reply(
@@ -735,18 +966,20 @@ const NUMERIC_EDIT_FIELDS = {
   amount: {
     title: "Swap amount",
     toDisplay: (value) => String(value ?? 0),
-    async persist(raw) {
+    async persist(raw, ctx) {
       const n = Number(raw || 0);
       await store.setAmount(n);
+      await syncSettingsSnapshot("update:amount", ctx);
       return n;
     },
   },
   marketCapMinimum: {
     title: "Minimum market cap",
     toDisplay: (value) => String(value ?? 0),
-    async persist(raw) {
+    async persist(raw, ctx) {
       const n = Number(raw || 0);
       await store.setMarketCapMinimum(n);
+      await syncSettingsSnapshot("update:marketCapMinimum", ctx);
       return n;
     },
   },
@@ -832,7 +1065,7 @@ async function handleNumericCallback(ctx, action) {
   } else if (action === "save") {
     try {
       const info = NUMERIC_EDIT_FIELDS[edit.field];
-      const persisted = await info.persist(edit.buffer);
+      const persisted = await info.persist(edit.buffer, ctx);
       ctx.session.numericEdit = null;
       await ctx.editMessageText(`Сохранено: ${info.title} = ${persisted}`, {
         parse_mode: "Markdown",
@@ -878,6 +1111,113 @@ bot.hears("Buy", async (ctx) => {
   await handleBuyStart(ctx);
 });
 
+bot.hears("Statistics", async (ctx) => {
+  try {
+    await ctx.sendChatAction?.("typing");
+    const tokensRaw = await fetchWalletTokens({ vsToken: SELL_PRICE_VS });
+    await updateWalletFromTokens(tokensRaw, {
+      reason: "statistics",
+      user: getUserContext(ctx),
+    });
+    if (!tokensRaw.length) {
+      await ctx.reply("В кошельке нет токенов для отображения статистики.");
+      return;
+    }
+
+    const tokens = tokensRaw.map((token) => {
+      const uiAmount = Number(token.uiAmount);
+      const valueUsdt = Number(token.valueUsdt);
+      const priceUsdt = Number(token.priceUsdt);
+      return {
+        mint: token.mint,
+        symbol: token.symbol || token.name || token.mint.slice(0, 6),
+        uiAmount: Number.isFinite(uiAmount) ? uiAmount : null,
+        valueUsdt: Number.isFinite(valueUsdt) ? valueUsdt : null,
+        priceUsdt: Number.isFinite(priceUsdt) ? priceUsdt : null,
+        decimals: token.decimals,
+      };
+    });
+
+    const valuedTokens = tokens.filter((token) =>
+      Number.isFinite(token.valueUsdt)
+    );
+
+    if (!valuedTokens.length) {
+      await ctx.reply(
+        "Не удалось определить стоимость токенов. Попробуйте позже."
+      );
+      return;
+    }
+
+    const totalValue = valuedTokens.reduce(
+      (sum, token) => sum + Number(token.valueUsdt),
+      0
+    );
+
+    const { stats } = await recordWalletSnapshot(STATISTICS_FILE, {
+      totalValue,
+      tokens,
+    });
+
+    const now = new Date();
+    const todayKey = formatDateKey(now);
+    const yesterdayKey = formatDateKey(new Date(now.getTime() - 24 * 60 * 60 * 1000));
+    const weekKey = formatDateKey(
+      new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000)
+    );
+
+    const prevDayEntry = stats.entries.find((entry) => entry.date === yesterdayKey);
+    const prevWeekEntry = stats.entries.find((entry) => entry.date === weekKey);
+
+    const lines = [
+      `📊 Статистика кошелька (${formatDateHuman(todayKey)})`,
+      `Текущий баланс: ${formatUsdDetailed(totalValue)}`,
+    ];
+
+    const dayLine = formatChangeLine({
+      label: "Изменение за 24ч",
+      currentValue: totalValue,
+      referenceEntry: prevDayEntry,
+    });
+    if (dayLine) {
+      lines.push(dayLine);
+    }
+
+    const weekLine = formatChangeLine({
+      label: "Изменение за 7д",
+      currentValue: totalValue,
+      referenceEntry: prevWeekEntry,
+    });
+    if (weekLine) {
+      lines.push(weekLine);
+    }
+
+    const tokensSorted = [...tokens].sort((a, b) => {
+      const av = Number.isFinite(a.valueUsdt) ? a.valueUsdt : -1;
+      const bv = Number.isFinite(b.valueUsdt) ? b.valueUsdt : -1;
+      return bv - av;
+    });
+
+    if (tokensSorted.length) {
+      lines.push("", "Токены:");
+      for (const token of tokensSorted) {
+        const amountText = Number.isFinite(token.uiAmount)
+          ? formatAmount(token.uiAmount)
+          : "?";
+        const valueText = Number.isFinite(token.valueUsdt)
+          ? formatUsdDetailed(token.valueUsdt)
+          : "≈$?";
+        lines.push(`- ${token.symbol}: ${amountText} (${valueText})`);
+      }
+    }
+
+    await ctx.reply(lines.join("\n"));
+  } catch (e) {
+    console.error("Statistics error", e);
+    await ctx.reply("Не удалось получить статистику: " + e.message);
+  }
+});
+
 bot.command("get", async (ctx) => {
   const s = await store.getAll();
   await ctx.replyWithMarkdown(
@@ -896,15 +1236,18 @@ bot.command("set", async (ctx) => {
       return ctx.reply("Use: /set <token|amount|marketCapMinimum> <value>");
     if (key === "token") {
       await store.setToken(value);
+      await syncSettingsSnapshot("update:token", ctx);
     } else if (key === "amount") {
       const n = Number(value);
       if (!Number.isFinite(n)) return ctx.reply("amount should be a number");
       await store.setAmount(n);
+      await syncSettingsSnapshot("update:amount", ctx);
     } else if (key === "marketCapMinimum") {
       const n = Number(value);
       if (!Number.isFinite(n) || n < 0)
         return ctx.reply("marketCapMinimum should be a non-negative number");
       await store.setMarketCapMinimum(n);
+      await syncSettingsSnapshot("update:marketCapMinimum", ctx);
     } else {
       return ctx.reply("Available keys: token, amount, marketCapMinimum");
     }
@@ -976,6 +1319,7 @@ bot.on("message", async (ctx, next) => {
     const raw = ctx.message.text.trim();
     if (key === "token") {
       await store.setToken(raw);
+      await syncSettingsSnapshot("update:token", ctx);
     }
     ctx.session.editKey = null;
     await ctx.reply("Saved ✅");
