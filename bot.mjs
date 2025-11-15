@@ -43,6 +43,130 @@ function makeKeyboard(settings) {
   return Markup.inlineKeyboard(rows);
 }
 
+const NUMERIC_EDIT_FIELDS = {
+  amount: {
+    title: "Swap amount",
+    toDisplay: (value) => String(value ?? 0),
+    async persist(raw) {
+      const n = Number(raw || 0);
+      await store.setAmount(n);
+      return n;
+    },
+  },
+  marketCapMinimum: {
+    title: "Minimum market cap",
+    toDisplay: (value) => String(value ?? 0),
+    async persist(raw) {
+      const n = Number(raw || 0);
+      await store.setMarketCapMinimum(n);
+      return n;
+    },
+  },
+};
+
+function makeNumericKeyboard() {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback("7", "num:7"),
+      Markup.button.callback("8", "num:8"),
+      Markup.button.callback("9", "num:9"),
+    ],
+    [
+      Markup.button.callback("4", "num:4"),
+      Markup.button.callback("5", "num:5"),
+      Markup.button.callback("6", "num:6"),
+    ],
+    [
+      Markup.button.callback("1", "num:1"),
+      Markup.button.callback("2", "num:2"),
+      Markup.button.callback("3", "num:3"),
+    ],
+    [
+      Markup.button.callback("0", "num:0"),
+      Markup.button.callback(".", "num:dot"),
+      Markup.button.callback("⬅️", "num:back"),
+    ],
+    [
+      Markup.button.callback("❌", "num:clear"),
+      Markup.button.callback("✅ Save", "num:save"),
+    ],
+    [Markup.button.callback("✖️ Cancel", "num:cancel")],
+  ]);
+}
+
+function numericPromptText(field, value) {
+  const info = NUMERIC_EDIT_FIELDS[field];
+  const visible = value === "" ? "0" : value;
+  return `*${info.title}*\nТекущее значение: \`${visible}\`\nИспользуйте кнопки ниже.`;
+}
+
+async function beginNumericEdit(ctx, field) {
+  const info = NUMERIC_EDIT_FIELDS[field];
+  const s = await store.getAll();
+  const initial = info.toDisplay(s[field]);
+  ctx.session ??= {};
+  ctx.session.editKey = null;
+  ctx.session.numericEdit = {
+    field,
+    buffer: initial === "0" ? "" : initial,
+    messageId: null,
+  };
+  const res = await ctx.reply(numericPromptText(field, ctx.session.numericEdit.buffer), {
+    parse_mode: "Markdown",
+    ...makeNumericKeyboard(),
+  });
+  ctx.session.numericEdit.messageId = res.message_id;
+}
+
+async function handleNumericCallback(ctx, action) {
+  await ctx.answerCbQuery().catch(() => {});
+  ctx.session ??= {};
+  const edit = ctx.session.numericEdit;
+  if (!edit) return;
+  const message = ctx.callbackQuery.message;
+  if (!message || message.message_id !== edit.messageId) return;
+  if (action === "cancel") {
+    ctx.session.numericEdit = null;
+    await ctx.editMessageText("Отменено").catch(() => {});
+    return;
+  }
+  if (action === "clear") {
+    edit.buffer = "";
+  } else if (action === "back") {
+    edit.buffer = edit.buffer.slice(0, -1);
+  } else if (action === "dot") {
+    if (!edit.buffer.includes(".")) {
+      edit.buffer = edit.buffer === "" ? "0." : `${edit.buffer}.`;
+    }
+  } else if (action === "save") {
+    try {
+      const info = NUMERIC_EDIT_FIELDS[edit.field];
+      const persisted = await info.persist(edit.buffer);
+      ctx.session.numericEdit = null;
+      await ctx.editMessageText(
+        `Сохранено: ${info.title} = ${persisted}`,
+        { parse_mode: "Markdown" }
+      );
+      const s = await store.getAll();
+      await ctx.reply("Current values:", makeKeyboard(s));
+    } catch (e) {
+      await ctx.reply("Error: " + e.message).catch(() => {});
+    }
+    return;
+  } else if (/^\d$/.test(action)) {
+    if (edit.buffer === "0") edit.buffer = "";
+    edit.buffer = `${edit.buffer}${action}`;
+  }
+
+  const nextText = numericPromptText(edit.field, edit.buffer);
+  await ctx
+    .editMessageText(nextText, {
+      parse_mode: "Markdown",
+      ...makeNumericKeyboard(),
+    })
+    .catch(() => {});
+}
+
 bot.start(async (ctx) => {
   await ctx.reply(
     "Hello! Here you can config *token*, *amount* и минимальный market cap.",
@@ -100,6 +224,10 @@ bot.command("set", async (ctx) => {
 bot.on("callback_query", async (ctx) => {
   try {
     const data = ctx.callbackQuery.data || "";
+    if (data.startsWith("num:")) {
+      await handleNumericCallback(ctx, data.slice(4));
+      return;
+    }
     if (data === "export") {
       await ctx.answerCbQuery();
       await ctx.replyWithDocument({
@@ -110,12 +238,21 @@ bot.on("callback_query", async (ctx) => {
     }
     if (!data.startsWith("edit:")) return;
     const key = data.split(":")[1];
-    ctx.session ??= {};
-    ctx.session.editKey = key;
-    await ctx.answerCbQuery();
-    await ctx.reply(`Insert value for \`${key}\`:`, {
-      parse_mode: "Markdown",
-    });
+    if (NUMERIC_EDIT_FIELDS[key]) {
+      await ctx.answerCbQuery();
+      await beginNumericEdit(ctx, key);
+      return;
+    }
+    if (key === "token") {
+      ctx.session ??= {};
+      ctx.session.editKey = key;
+      await ctx.answerCbQuery();
+      await ctx.reply(`Insert value for \`${key}\`:`, {
+        parse_mode: "Markdown",
+      });
+      return;
+    }
+    await ctx.answerCbQuery("Unknown field", { show_alert: true });
   } catch (e) {
     await ctx.answerCbQuery().catch(() => {});
     await ctx.reply("Error: " + e.message);
@@ -131,10 +268,6 @@ bot.on("message", async (ctx, next) => {
     const raw = ctx.message.text.trim();
     if (key === "token") {
       await store.setToken(raw);
-    } else if (key === "amount") {
-      await store.setAmount(raw);
-    } else if (key === "marketCapMinimum") {
-      await store.setMarketCapMinimum(raw);
     }
     ctx.session.editKey = null;
     const s = await store.getAll();
