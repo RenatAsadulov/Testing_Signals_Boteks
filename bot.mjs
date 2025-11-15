@@ -12,7 +12,11 @@ if (!BOT_TOKEN) {
   process.exit(1);
 }
 
-const store = new Store(SETTINGS_FILE, { token: "", amount: 0 });
+const store = new Store(SETTINGS_FILE, {
+  token: "",
+  amount: 0,
+  marketCapMinimum: 0,
+});
 await store.load();
 
 const bot = new Telegraf(BOT_TOKEN);
@@ -28,15 +32,24 @@ function makeKeyboard(settings) {
       ),
     ],
     [Markup.button.callback(`amount: ${settings.amount}`, "edit:amount")],
+    [
+      Markup.button.callback(
+        `market cap ≥ ${settings.marketCapMinimum ?? 0}`,
+        "edit:marketCapMinimum"
+      ),
+    ],
     [Markup.button.callback("📤 Export JSON", "export")],
   ];
   return Markup.inlineKeyboard(rows);
 }
 
 bot.start(async (ctx) => {
-  await ctx.reply("Hello! Here you can config *token* и *amount*.", {
-    parse_mode: "Markdown",
-  });
+  await ctx.reply(
+    "Hello! Here you can config *token*, *amount* и минимальный market cap.",
+    {
+      parse_mode: "Markdown",
+    }
+  );
   const s = await store.getAll();
   await ctx.reply("Current values:", makeKeyboard(s));
 });
@@ -49,7 +62,9 @@ bot.command("settings", async (ctx) => {
 bot.command("get", async (ctx) => {
   const s = await store.getAll();
   await ctx.replyWithMarkdown(
-    `\- token: \`${s.token}\`\n\- amount: \`${s.amount}\``
+    `\- token: \`${s.token}\`\n` +
+      `\- amount: \`${s.amount}\`\n` +
+      `\- marketCapMinimum: \`${s.marketCapMinimum ?? 0}\``
   );
 });
 
@@ -58,15 +73,21 @@ bot.command("set", async (ctx) => {
     // assertOwner(ctx);
     const [, key, ...rest] = (ctx.message.text || "").split(/\s+/);
     const value = rest.join(" ");
-    if (!key || !value) return ctx.reply("Use: /set <token|amount> <value>");
+    if (!key || !value)
+      return ctx.reply("Use: /set <token|amount|marketCapMinimum> <value>");
     if (key === "token") {
       await store.setToken(value);
     } else if (key === "amount") {
       const n = Number(value);
       if (!Number.isFinite(n)) return ctx.reply("amount should be a number");
       await store.setAmount(n);
+    } else if (key === "marketCapMinimum") {
+      const n = Number(value);
+      if (!Number.isFinite(n) || n < 0)
+        return ctx.reply("marketCapMinimum should be a non-negative number");
+      await store.setMarketCapMinimum(n);
     } else {
-      return ctx.reply("Available keys: token, amount");
+      return ctx.reply("Available keys: token, amount, marketCapMinimum");
     }
     const s = await store.getAll();
     await ctx.reply("Saved ✅");
@@ -112,6 +133,8 @@ bot.on("message", async (ctx, next) => {
       await store.setToken(raw);
     } else if (key === "amount") {
       await store.setAmount(raw);
+    } else if (key === "marketCapMinimum") {
+      await store.setMarketCapMinimum(raw);
     }
     ctx.session.editKey = null;
     const s = await store.getAll();
