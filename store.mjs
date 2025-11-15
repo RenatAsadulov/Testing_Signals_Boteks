@@ -4,7 +4,12 @@ import path from "node:path";
 export class Store {
   constructor(
     filePath,
-    defaults = { token: "", amount: 0, marketCapMinimum: 0 }
+    defaults = {
+      token: "",
+      amount: 0,
+      marketCapMinimum: 0,
+      profitTargetPercent: 0,
+    }
   ) {
     this.filePath = filePath;
     this.defaults = defaults;
@@ -25,6 +30,7 @@ export class Store {
         token: "",
         amount: 0,
         marketCapMinimum: 0,
+        profitTargetPercent: 0,
         ...data,
       };
       return this.cache;
@@ -80,6 +86,15 @@ export class Store {
       throw new Error("marketCapMinimum must be a non-negative number");
     const current = await this.getAll();
     const next = { ...current, marketCapMinimum: n };
+    return this.enqueue(next);
+  }
+
+  async setProfitTargetPercent(value) {
+    const n = Number(value);
+    if (!Number.isFinite(n) || n < 0)
+      throw new Error("profitTargetPercent must be a non-negative number");
+    const current = await this.getAll();
+    const next = { ...current, profitTargetPercent: n };
     return this.enqueue(next);
   }
 
