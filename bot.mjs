@@ -1,7 +1,6 @@
 import "dotenv/config";
 import { Telegraf, Markup, session } from "telegraf";
 import { Store } from "./store.mjs";
-import path from "node:path";
 import { recordWalletSnapshot } from "./walletStatistics.mjs";
 import {
   initMongo,
@@ -34,6 +33,7 @@ const store = new Store(SETTINGS_FILE, {
   token: "",
   amount: 0,
   marketCapMinimum: 0,
+  profitTargetPercent: 0,
 });
 await store.load();
 
@@ -151,28 +151,26 @@ async function trackTokenAction(ctx, payload) {
 }
 
 function makeKeyboard(settings) {
+  const currencyLabel = `Currency: ${settings.token || "not set"}`;
+  const profitTargetLabel = `Profit target: ${formatPercent(
+    settings.profitTargetPercent
+  )}`;
+  const amountParts = [`Amount: ${formatTradeAmount(settings.amount)}`];
+  if (settings.token) {
+    amountParts.push(settings.token);
+  }
+  const amountLabel = amountParts.join(" ");
   const rows = [
-    [
-      Markup.button.callback(
-        `token: ${settings.token || "<empty>"}`,
-        "edit:token"
-      ),
-    ],
-    [Markup.button.callback(`amount: ${settings.amount}`, "edit:amount")],
-    [
-      Markup.button.callback(
-        `market cap ≥ ${settings.marketCapMinimum ?? 0}`,
-        "edit:marketCapMinimum"
-      ),
-    ],
-    [Markup.button.callback("📤 Export JSON", "export")],
+    [Markup.button.callback(currencyLabel, "edit:token")],
+    [Markup.button.callback(profitTargetLabel, "edit:profitTargetPercent")],
+    [Markup.button.callback(amountLabel, "edit:amount")],
   ];
   return Markup.inlineKeyboard(rows);
 }
 
 function makeMainMenuKeyboard() {
   return Markup.keyboard(
-    [["Sell", "Buy"], ["Statistics", "Configuration"], ["Trade-Bot"]],
+    [["Sell", "Buy"], ["Statistics", "Trade-Bot"]],
     { columns: 2 }
   )
     .resize()
@@ -199,6 +197,11 @@ const amountFormatter = new Intl.NumberFormat("en-US", {
   maximumFractionDigits: 6,
 });
 
+const percentFormatter = new Intl.NumberFormat("en-US", {
+  minimumFractionDigits: 0,
+  maximumFractionDigits: 2,
+});
+
 function formatUsd(value) {
   if (!Number.isFinite(value)) return "≈$?";
   return `≈$${usdFormatter.format(value)}`;
@@ -207,6 +210,18 @@ function formatUsd(value) {
 function formatAmount(value) {
   if (!Number.isFinite(value)) return "?";
   return amountFormatter.format(value);
+}
+
+function formatTradeAmount(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return amountFormatter.format(0);
+  return amountFormatter.format(num);
+}
+
+function formatPercent(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return "0%";
+  return `${percentFormatter.format(num)}%`;
 }
 
 function formatUsdDetailed(value) {
@@ -959,12 +974,15 @@ function hasSettings(settings) {
 
 async function replyWithSettings(ctx) {
   const s = await store.getAll();
-  await ctx.reply("Trade-Bot", makeMainMenuKeyboard());
+  await ctx.reply(
+    "⚙️ Настройте трейд-бота: выберите параметр ниже.",
+    makeKeyboard(s)
+  );
 }
 
 const NUMERIC_EDIT_FIELDS = {
   amount: {
-    title: "Swap amount",
+    title: "Сумма сделки",
     toDisplay: (value) => String(value ?? 0),
     async persist(raw, ctx) {
       const n = Number(raw || 0);
@@ -973,13 +991,13 @@ const NUMERIC_EDIT_FIELDS = {
       return n;
     },
   },
-  marketCapMinimum: {
-    title: "Minimum market cap",
+  profitTargetPercent: {
+    title: "Цель по прибыли (%)",
     toDisplay: (value) => String(value ?? 0),
     async persist(raw, ctx) {
       const n = Number(raw || 0);
-      await store.setMarketCapMinimum(n);
-      await syncSettingsSnapshot("update:marketCapMinimum", ctx);
+      await store.setProfitTargetPercent(n);
+      await syncSettingsSnapshot("update:profitTargetPercent", ctx);
       return n;
     },
   },
@@ -1091,9 +1109,10 @@ async function handleNumericCallback(ctx, action) {
 
 bot.start(async (ctx) => {
   await ctx.reply(
-    "Hello! Here you can config *token*, *amount* и *market cap*.", // TODO update text
+    "Привет! Используй меню для управления сделками. Нажми *Trade-Bot*, чтобы настроить валюту, цель по прибыли и сумму сделки.",
     {
       parse_mode: "Markdown",
+      ...makeMainMenuKeyboard(),
     }
   );
   await replyWithSettings(ctx);
@@ -1218,11 +1237,16 @@ bot.hears("Statistics", async (ctx) => {
   }
 });
 
+bot.hears("Trade-Bot", async (ctx) => {
+  await replyWithSettings(ctx);
+});
+
 bot.command("get", async (ctx) => {
   const s = await store.getAll();
   await ctx.replyWithMarkdown(
     `\- token: \`${s.token}\`\n` +
       `\- amount: \`${s.amount}\`\n` +
+      `\- profitTargetPercent: \`${s.profitTargetPercent ?? 0}\`\n` +
       `\- marketCapMinimum: \`${s.marketCapMinimum ?? 0}\``
   );
 });
@@ -1233,7 +1257,9 @@ bot.command("set", async (ctx) => {
     const [, key, ...rest] = (ctx.message.text || "").split(/\s+/);
     const value = rest.join(" ");
     if (!key || !value)
-      return ctx.reply("Use: /set <token|amount|marketCapMinimum> <value>");
+      return ctx.reply(
+        "Use: /set <token|amount|profitTargetPercent|marketCapMinimum> <value>"
+      );
     if (key === "token") {
       await store.setToken(value);
       await syncSettingsSnapshot("update:token", ctx);
@@ -1242,6 +1268,14 @@ bot.command("set", async (ctx) => {
       if (!Number.isFinite(n)) return ctx.reply("amount should be a number");
       await store.setAmount(n);
       await syncSettingsSnapshot("update:amount", ctx);
+    } else if (key === "profitTargetPercent") {
+      const n = Number(value);
+      if (!Number.isFinite(n) || n < 0)
+        return ctx.reply(
+          "profitTargetPercent should be a non-negative number"
+        );
+      await store.setProfitTargetPercent(n);
+      await syncSettingsSnapshot("update:profitTargetPercent", ctx);
     } else if (key === "marketCapMinimum") {
       const n = Number(value);
       if (!Number.isFinite(n) || n < 0)
@@ -1249,7 +1283,9 @@ bot.command("set", async (ctx) => {
       await store.setMarketCapMinimum(n);
       await syncSettingsSnapshot("update:marketCapMinimum", ctx);
     } else {
-      return ctx.reply("Available keys: token, amount, marketCapMinimum");
+      return ctx.reply(
+        "Available keys: token, amount, profitTargetPercent, marketCapMinimum"
+      );
     }
     await ctx.reply("Saved ✅");
     await replyWithSettings(ctx);
@@ -1271,14 +1307,6 @@ bot.on("callback_query", async (ctx) => {
     }
     if (data.startsWith("num:")) {
       await handleNumericCallback(ctx, data.slice(4));
-      return;
-    }
-    if (data === "export") {
-      await ctx.answerCbQuery();
-      await ctx.replyWithDocument({
-        source: path.resolve(SETTINGS_FILE),
-        filename: "settings.json",
-      });
       return;
     }
     if (!data.startsWith("edit:")) return;

@@ -1,5 +1,6 @@
 {
   "token": "USDT",
   "amount": 0.01,
-  "marketCapMinimum": 0
+  "marketCapMinimum": 0,
+  "profitTargetPercent": 0
 }
