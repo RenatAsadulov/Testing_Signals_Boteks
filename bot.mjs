@@ -202,10 +202,10 @@ async function handleSellCallback(ctx, data) {
       return;
     }
     flow.stage = "awaiting_amount";
+    const availableAmount = formatAmount(flow.selectedToken.uiAmount);
+    const availableValue = formatUsd(flow.selectedToken.valueUsdt);
     await ctx.reply(
-      `Введите количество ${flow.selectedToken.symbol} для обмена (доступно ${formatAmount(
-        flow.selectedToken.uiAmount
-      )}). Вы можете ввести число или MAX.`
+      `Введите количество ${flow.selectedToken.symbol} для обмена (доступно ${availableAmount}, ${availableValue}). Вы можете ввести число или MAX.`
     );
     return;
   }
