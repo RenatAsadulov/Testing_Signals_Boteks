@@ -466,11 +466,17 @@ export async function fetchWalletTokens({ vsToken = "USDT" } = {}) {
   const consolidated = Array.from(aggregated.values());
 
   let priceByMint = {};
+  const fallbackVsTokens = [];
+  if (vsToken && vsToken.toUpperCase() !== "USDC") {
+    fallbackVsTokens.push("USDC");
+  }
+  fallbackVsTokens.push(null);
+
   try {
-    priceByMint = await getPricesByMint(
-      consolidated.map((t) => t.mint),
-      { vsToken }
-    );
+    priceByMint = await getPricesByMint(consolidated.map((t) => t.mint), {
+      vsToken,
+      fallbackVsTokens,
+    });
   } catch (e) {
     console.warn("Failed to load prices:", e.message);
   }
@@ -526,8 +532,28 @@ export async function getSwapQuote({
     swapMode,
     slippageBps: slippageBps ?? getDefaultSlippageBps(),
   };
-  const { data } = await jax.get("/v6/quote", { params });
-  return data;
+  try {
+    const { data } = await jax.get("/v6/quote", { params });
+    return data;
+  } catch (err) {
+    const { response } = err || {};
+    const payload = response?.data || {};
+    const code = payload.errorCode || payload.code;
+    const rawMessage =
+      payload.error || payload.message || response?.statusText || err?.message;
+
+    if (code === "COULD_NOT_FIND_ANY_ROUTE") {
+      throw new Error(
+        "Jupiter не нашёл маршрут для этого обмена. Попробуйте уменьшить сумму или выбрать другую пару."
+      );
+    }
+
+    if (rawMessage) {
+      throw new Error(rawMessage);
+    }
+
+    throw err;
+  }
 }
 
 export async function executeSwapQuote(quoteResponse, opt = {}) {
@@ -623,30 +649,75 @@ async function __resolveMintBySymbol(symbol) {
 
 /** Цена(ы) по mint(ам). По умолчанию в USDC. */
 export async function getPricesByMint(mintOrMints, opt = {}) {
-  const jax = __createPriceClient({});
   const ids = Array.isArray(mintOrMints) ? mintOrMints : [mintOrMints];
+  if (!ids.length) return {};
 
-  // vsToken может быть символом — попробуем резолвнуть в mint
-  let vsTokenId = opt.vsToken || "USDC";
-  if (vsTokenId && vsTokenId.length < 32) {
-    try {
-      const vs = await __resolveMintBySymbol(vsTokenId);
-      vsTokenId = vs.mint;
-    } catch {
-      /* игнор, Jupiter вернёт дефолтные валюты */
+  const fallbackVsTokens = Array.isArray(opt.fallbackVsTokens)
+    ? opt.fallbackVsTokens
+    : [];
+
+  const priceClient = __createPriceClient({});
+
+  async function fetchForVsToken(vsTokenSymbolOrMint) {
+    if (!vsTokenSymbolOrMint) {
+      const { data } = await priceClient.get("/v3/price", {
+        params: { ids: ids.join(",") },
+      });
+      return data?.data || {};
+    }
+
+    let vsTokenId = vsTokenSymbolOrMint;
+    if (vsTokenId.length < 32) {
+      try {
+        const resolved = await __resolveMintBySymbol(vsTokenId);
+        vsTokenId = resolved.mint;
+      } catch {
+        // если не получилось резолвнуть символ — пробуем как есть
+      }
+    }
+
+    const { data } = await priceClient.get("/v3/price", {
+      params: {
+        ids: ids.join(","),
+        vsToken: vsTokenId,
+        ...(opt.vsAmount ? { vsAmount: opt.vsAmount } : {}),
+        ...(opt.onlyVsToken ? { onlyVsToken: true } : {}),
+      },
+    });
+
+    return data?.data || {};
+  }
+
+  let priceMap = {};
+  try {
+    priceMap = await fetchForVsToken(opt.vsToken || "USDC");
+  } catch (err) {
+    console.warn("Primary price fetch failed:", err?.message || err);
+  }
+
+  let missing = ids.filter((id) => !priceMap[id]);
+  if (missing.length && fallbackVsTokens.length) {
+    for (const fallbackVs of fallbackVsTokens) {
+      try {
+        const extra = await fetchForVsToken(fallbackVs);
+        for (const id of missing) {
+          if (extra[id] && !priceMap[id]) {
+            priceMap[id] = extra[id];
+          }
+        }
+        missing = missing.filter((id) => !priceMap[id]);
+        if (!missing.length) break;
+      } catch (err) {
+        console.warn(
+          "Fallback price fetch failed for",
+          fallbackVs,
+          err?.message || err
+        );
+      }
     }
   }
 
-  const { data } = await jax.get("/v3/price", {
-    params: {
-      ids: ids.join(","),
-      ...(vsTokenId ? { vsToken: vsTokenId } : {}),
-      ...(opt.vsAmount ? { vsAmount: opt.vsAmount } : {}),
-      ...(opt.onlyVsToken ? { onlyVsToken: true } : {}),
-    },
-  });
-
-  return data?.data || {};
+  return priceMap;
 }
 
 /** Цена по символу (например 'SOL'/'BONK'). */
