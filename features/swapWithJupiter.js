@@ -3,7 +3,12 @@ import axios from "axios";
 import https from "node:https";
 import bs58 from "bs58";
 import { setDefaultResultOrder } from "node:dns";
-import { Connection, Keypair, VersionedTransaction } from "@solana/web3.js";
+import {
+  Connection,
+  Keypair,
+  PublicKey,
+  VersionedTransaction,
+} from "@solana/web3.js";
 
 setDefaultResultOrder?.("ipv4first");
 
@@ -15,6 +20,56 @@ const {
   SLIPPAGE_BBS,
   PRIORITY_MAX_LAMPORTS,
 } = process.env;
+
+const SOL_MINT = "So11111111111111111111111111111111111111112";
+const SOL_DECIMALS = 9;
+const SPL_TOKEN_PROGRAM_ID = new PublicKey(
+  "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+);
+
+let __connection;
+let __wallet;
+let __jax;
+
+function ensureConnection() {
+  if (!RPC_URL) throw new Error("RPC_URL is not configured");
+  if (!__connection) {
+    __connection = new Connection(RPC_URL, { commitment: "confirmed" });
+  }
+  return __connection;
+}
+
+function ensureWallet() {
+  if (!WALLET_SECRET_KEY) throw new Error("WALLET_SECRET_KEY is not configured");
+  if (!__wallet) {
+    __wallet = keypairFromAny(WALLET_SECRET_KEY);
+  }
+  return __wallet;
+}
+
+function ensureJax() {
+  if (!__jax) {
+    __jax = createJupClient({
+      host: JUPITER_HOST || "quote-api.jup.ag",
+      ip: JUPITER_IP,
+    });
+  }
+  return __jax;
+}
+
+function getDefaultSlippageBps() {
+  const fallback = 50;
+  if (!SLIPPAGE_BBS) return fallback;
+  const parsed = Number(SLIPPAGE_BBS);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function getPriorityFeeLamports() {
+  const fallback = 200_000;
+  if (!PRIORITY_MAX_LAMPORTS) return fallback;
+  const parsed = Number(PRIORITY_MAX_LAMPORTS);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
 
 // -----------------------------
 // Константы / заголовки
@@ -230,14 +285,11 @@ export async function swapOneSolToCoinLiteral(
     };
   }
   try {
-    const conn = new Connection(RPC_URL, { commitment: "confirmed" });
-    const wallet = keypairFromAny(WALLET_SECRET_KEY);
+    const conn = ensureConnection();
+    const wallet = ensureWallet();
 
     // HTTP клиент для Jupiter v6
-    const JAX = createJupClient({
-      host: JUPITER_HOST || "quote-api.jup.ag",
-      ip: JUPITER_IP,
-    });
+    const JAX = ensureJax();
 
     // 1) mint по символу
     const outSym = normalizeLiteral(coinLiteral); // "$BONK" -> "BONK"
@@ -271,7 +323,7 @@ export async function swapOneSolToCoinLiteral(
       inputMint: inToken.mint,
       outputMint,
       amount,
-      slippageBps: SLIPPAGE_BBS,
+      slippageBps: getDefaultSlippageBps(),
       swapMode: "ExactIn",
     };
 
@@ -282,7 +334,7 @@ export async function swapOneSolToCoinLiteral(
       q: quoteRaw,
       conn,
       wallet,
-      priorityMaxLamports: PRIORITY_MAX_LAMPORTS,
+      priorityMaxLamports: getPriorityFeeLamports(),
     });
 
     const solcanLink = `https://solscan.io/tx/${sig}`;
@@ -299,6 +351,149 @@ export async function swapOneSolToCoinLiteral(
     return { status: "error", text: "Error: " + error.message };
   }
 }
+
+export async function resolveSymbolToMint(symbol) {
+  return resolveMintBySymbol(symbol);
+}
+
+export async function fetchWalletTokens({ vsToken = "USDT" } = {}) {
+  const conn = ensureConnection();
+  const wallet = ensureWallet();
+
+  const [solLamports, tokenAccounts] = await Promise.all([
+    conn.getBalance(wallet.publicKey, "confirmed"),
+    conn.getParsedTokenAccountsByOwner(wallet.publicKey, {
+      programId: SPL_TOKEN_PROGRAM_ID,
+    }),
+  ]);
+
+  const tokens = [];
+
+  if (solLamports > 0) {
+    const solUi = solLamports / 10 ** SOL_DECIMALS;
+    tokens.push({
+      mint: SOL_MINT,
+      decimals: SOL_DECIMALS,
+      rawAmount: solLamports.toString(),
+      uiAmount: solUi,
+      uiAmountString: solUi.toString(),
+      source: "sol",
+    });
+  }
+
+  for (const acc of tokenAccounts.value || []) {
+    const parsed = acc.account?.data?.parsed;
+    const info = parsed?.info;
+    const tokenAmount = info?.tokenAmount;
+    if (!info || !tokenAmount) continue;
+    const rawAmount = tokenAmount.amount;
+    if (!rawAmount || rawAmount === "0") continue;
+    const decimals = Number(tokenAmount.decimals ?? 0);
+    const uiAmountString = tokenAmount.uiAmountString || String(tokenAmount.uiAmount || 0);
+    const uiAmount = Number(uiAmountString);
+    if (!Number.isFinite(uiAmount) || uiAmount <= 0) continue;
+    tokens.push({
+      mint: info.mint,
+      decimals,
+      rawAmount,
+      uiAmount,
+      uiAmountString,
+      source: "spl",
+    });
+  }
+
+  if (!tokens.length) return [];
+
+  const aggregated = new Map();
+  for (const token of tokens) {
+    const key = token.mint;
+    const existing = aggregated.get(key);
+    if (!existing) {
+      aggregated.set(key, { ...token });
+      continue;
+    }
+    existing.rawAmount = (
+      BigInt(existing.rawAmount) + BigInt(token.rawAmount)
+    ).toString();
+    existing.uiAmount = Number(existing.uiAmount) + Number(token.uiAmount);
+    existing.uiAmountString = (
+      Number(existing.uiAmountString) + Number(token.uiAmount)
+    ).toString();
+  }
+
+  const consolidated = Array.from(aggregated.values());
+
+  let priceByMint = {};
+  try {
+    priceByMint = await getPricesByMint(
+      consolidated.map((t) => t.mint),
+      { vsToken, onlyVsToken: true }
+    );
+  } catch (e) {
+    console.warn("Failed to load prices:", e.message);
+  }
+
+  const enriched = consolidated.map((token) => {
+    const price = priceByMint[token.mint] || null;
+    const priceUsdt = price?.price ? Number(price.price) : null;
+    const valueUsdt =
+      priceUsdt != null && Number.isFinite(priceUsdt)
+        ? priceUsdt * Number(token.uiAmount)
+        : null;
+    return {
+      ...token,
+      symbol:
+        price?.symbol ||
+        (token.mint === SOL_MINT ? "SOL" : token.mint.slice(0, 6)),
+      name: price?.name || null,
+      priceUsdt,
+      valueUsdt,
+    };
+  });
+
+  enriched.sort((a, b) => {
+    const va = Number.isFinite(a.valueUsdt) ? a.valueUsdt : -1;
+    const vb = Number.isFinite(b.valueUsdt) ? b.valueUsdt : -1;
+    return vb - va;
+  });
+
+  return enriched;
+}
+
+export async function getSwapQuote({
+  inputMint,
+  outputMint,
+  amount,
+  slippageBps,
+  swapMode = "ExactIn",
+}) {
+  const jax = ensureJax();
+  const params = {
+    inputMint,
+    outputMint,
+    amount,
+    swapMode,
+    slippageBps: slippageBps ?? getDefaultSlippageBps(),
+  };
+  const { data } = await jax.get("/v6/quote", { params });
+  return data;
+}
+
+export async function executeSwapQuote(quoteResponse, opt = {}) {
+  if (!quoteResponse) throw new Error("quoteResponse is required");
+  const conn = ensureConnection();
+  const wallet = ensureWallet();
+  const jax = ensureJax();
+  return buildSignSendSwap({
+    jax,
+    q: quoteResponse,
+    conn,
+    wallet,
+    priorityMaxLamports: opt.priorityMaxLamports ?? getPriorityFeeLamports(),
+  });
+}
+
+export { toRawAmount };
 
 // ====== Jupiter Price API (drop-in) ========================================
 // Требуются axios и https уже импортированные в файле.
