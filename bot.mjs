@@ -2,6 +2,7 @@ import "dotenv/config";
 import { Telegraf, Markup, session } from "telegraf";
 import { Store } from "./store.mjs";
 import path from "node:path";
+import { recordWalletSnapshot } from "./walletStatistics.mjs";
 import {
   executeSwapQuote,
   fetchWalletTokens,
@@ -13,6 +14,8 @@ import {
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const OWNER_ID = process.env.OWNER_ID ? Number(process.env.OWNER_ID) : null;
 const SETTINGS_FILE = process.env.SETTINGS_FILE || "./data/settings.json";
+const STATISTICS_FILE =
+  process.env.STATISTICS_FILE || "./data/wallet-statistics.json";
 
 if (!BOT_TOKEN) {
   console.error("Please set BOT_TOKEN in .env");
@@ -93,6 +96,43 @@ function formatUsdDetailed(value) {
   if (!Number.isFinite(value)) return "неизвестно";
   if (Math.abs(value) >= 1) return formatUsd(value);
   return `≈$${Number(value).toPrecision(4)}`;
+}
+
+function formatDateKey(date) {
+  const d = date instanceof Date ? date : new Date(date || Date.now());
+  return d.toISOString().slice(0, 10);
+}
+
+function formatDateHuman(dateKey) {
+  const date = new Date(`${dateKey}T00:00:00Z`);
+  if (Number.isNaN(date.getTime())) return dateKey;
+  return new Intl.DateTimeFormat("ru-RU", {
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+  }).format(date);
+}
+
+function formatUsdChange(diff) {
+  const sign = diff >= 0 ? "+" : "-";
+  return `${sign}${formatUsdDetailed(Math.abs(diff))}`;
+}
+
+function formatChangeLine({ label, currentValue, referenceEntry }) {
+  if (!Number.isFinite(currentValue)) return null;
+  if (!referenceEntry || !Number.isFinite(referenceEntry.totalValue)) return null;
+  const diff = currentValue - Number(referenceEntry.totalValue);
+  const percent =
+    Number(referenceEntry.totalValue) !== 0
+      ? (diff / Number(referenceEntry.totalValue)) * 100
+      : null;
+  const parts = [`${label}: ${formatUsdChange(diff)}`];
+  if (Number.isFinite(percent)) {
+    const sign = diff >= 0 ? "+" : "-";
+    parts.push(`(${sign}${Math.abs(percent).toFixed(2)}%)`);
+  }
+  parts.push(`(с ${formatDateHuman(referenceEntry.date)})`);
+  return parts.join(" ");
 }
 
 function pickMetaNumber(meta, keys) {
@@ -876,6 +916,109 @@ bot.hears("Sell", async (ctx) => {
 
 bot.hears("Buy", async (ctx) => {
   await handleBuyStart(ctx);
+});
+
+bot.hears("Statistics", async (ctx) => {
+  try {
+    await ctx.sendChatAction?.("typing");
+    const tokensRaw = await fetchWalletTokens({ vsToken: SELL_PRICE_VS });
+    if (!tokensRaw.length) {
+      await ctx.reply("В кошельке нет токенов для отображения статистики.");
+      return;
+    }
+
+    const tokens = tokensRaw.map((token) => {
+      const uiAmount = Number(token.uiAmount);
+      const valueUsdt = Number(token.valueUsdt);
+      const priceUsdt = Number(token.priceUsdt);
+      return {
+        mint: token.mint,
+        symbol: token.symbol || token.name || token.mint.slice(0, 6),
+        uiAmount: Number.isFinite(uiAmount) ? uiAmount : null,
+        valueUsdt: Number.isFinite(valueUsdt) ? valueUsdt : null,
+        priceUsdt: Number.isFinite(priceUsdt) ? priceUsdt : null,
+        decimals: token.decimals,
+      };
+    });
+
+    const valuedTokens = tokens.filter((token) =>
+      Number.isFinite(token.valueUsdt)
+    );
+
+    if (!valuedTokens.length) {
+      await ctx.reply(
+        "Не удалось определить стоимость токенов. Попробуйте позже."
+      );
+      return;
+    }
+
+    const totalValue = valuedTokens.reduce(
+      (sum, token) => sum + Number(token.valueUsdt),
+      0
+    );
+
+    const { stats } = await recordWalletSnapshot(STATISTICS_FILE, {
+      totalValue,
+      tokens,
+    });
+
+    const now = new Date();
+    const todayKey = formatDateKey(now);
+    const yesterdayKey = formatDateKey(new Date(now.getTime() - 24 * 60 * 60 * 1000));
+    const weekKey = formatDateKey(
+      new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000)
+    );
+
+    const prevDayEntry = stats.entries.find((entry) => entry.date === yesterdayKey);
+    const prevWeekEntry = stats.entries.find((entry) => entry.date === weekKey);
+
+    const lines = [
+      `📊 Статистика кошелька (${formatDateHuman(todayKey)})`,
+      `Текущий баланс: ${formatUsdDetailed(totalValue)}`,
+    ];
+
+    const dayLine = formatChangeLine({
+      label: "Изменение за 24ч",
+      currentValue: totalValue,
+      referenceEntry: prevDayEntry,
+    });
+    if (dayLine) {
+      lines.push(dayLine);
+    }
+
+    const weekLine = formatChangeLine({
+      label: "Изменение за 7д",
+      currentValue: totalValue,
+      referenceEntry: prevWeekEntry,
+    });
+    if (weekLine) {
+      lines.push(weekLine);
+    }
+
+    const tokensSorted = [...tokens].sort((a, b) => {
+      const av = Number.isFinite(a.valueUsdt) ? a.valueUsdt : -1;
+      const bv = Number.isFinite(b.valueUsdt) ? b.valueUsdt : -1;
+      return bv - av;
+    });
+
+    if (tokensSorted.length) {
+      lines.push("", "Токены:");
+      for (const token of tokensSorted) {
+        const amountText = Number.isFinite(token.uiAmount)
+          ? formatAmount(token.uiAmount)
+          : "?";
+        const valueText = Number.isFinite(token.valueUsdt)
+          ? formatUsdDetailed(token.valueUsdt)
+          : "≈$?";
+        lines.push(`- ${token.symbol}: ${amountText} (${valueText})`);
+      }
+    }
+
+    await ctx.reply(lines.join("\n"));
+  } catch (e) {
+    console.error("Statistics error", e);
+    await ctx.reply("Не удалось получить статистику: " + e.message);
+  }
 });
 
 bot.command("get", async (ctx) => {
