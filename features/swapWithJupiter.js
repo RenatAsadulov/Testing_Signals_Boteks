@@ -208,7 +208,6 @@ function pickExactSymbolPreferVerified(results, wantSym) {
  * @returns {Promise<string>} подпись транзакции
  */
 export async function swapOneSolToCoinLiteral(coinLiteral, amountC, literl) {
-  console.log("amount", amountC);
   if (!amountC || !literl) {
     return {
       status: "error",
@@ -260,3 +259,144 @@ export async function swapOneSolToCoinLiteral(coinLiteral, amountC, literl) {
     return { status: "error", text: "Error: " + error.message };
   }
 }
+
+// ====== Jupiter Price API (drop-in) ========================================
+// Требуются axios и https уже импортированные в файле.
+// Опциональные ENV: PRICE_HOST=price.jup.ag, PRICE_IP=<ip>
+
+const __PRICE_HEADERS =
+  typeof COMMON_HEADERS !== "undefined"
+    ? COMMON_HEADERS
+    : {
+        accept: "application/json",
+        "user-agent": "riichard-swap-bot/1.0",
+        origin: "https://jup.ag",
+        referer: "https://jup.ag/",
+      };
+
+const { PRICE_HOST = "price.jup.ag", PRICE_IP } = process.env;
+
+function __createPriceClient({ host = PRICE_HOST, ip = PRICE_IP } = {}) {
+  if (ip) {
+    return axios.create({
+      baseURL: `https://${ip}`,
+      httpsAgent: new https.Agent({
+        family: 4,
+        keepAlive: false,
+        servername: host,
+      }),
+      headers: { ...__PRICE_HEADERS, host },
+      timeout: 15000,
+    });
+  }
+  return axios.create({
+    baseURL: `https://${host}`,
+    httpsAgent: new https.Agent({ family: 4, keepAlive: false }),
+    headers: { ...__PRICE_HEADERS },
+    timeout: 15000,
+  });
+}
+
+// ---- Tokens v2 search (используем существующий TOKENS_AX, если он есть)
+const __TOK_AX =
+  typeof TOKENS_AX !== "undefined"
+    ? TOKENS_AX
+    : axios.create({
+        baseURL: "https://lite-api.jup.ag",
+        httpsAgent: new https.Agent({ family: 4, keepAlive: false }),
+        headers: { ...__PRICE_HEADERS },
+        timeout: 15000,
+      });
+
+async function __jupSearchSymbol(symbol) {
+  const { data } = await __TOK_AX.get("/tokens/v2/search", {
+    params: { query: symbol },
+  });
+  return data || [];
+}
+
+function __pickExactSymbolPreferVerified(results, wantSym) {
+  const want = wantSym.toUpperCase();
+  const exact = (results || []).filter(
+    (t) => (t.symbol || "").toUpperCase() === want
+  );
+  if (!exact.length) throw new Error(`No exact symbol match for "${wantSym}".`);
+  const verified = exact.filter((t) => !!t.verified);
+  if (verified.length) return verified[0];
+  exact.sort((a, b) => (b.liquidity ?? 0) - (a.liquidity ?? 0));
+  return exact[0];
+}
+
+async function __resolveMintBySymbol(symbol) {
+  const list = await __jupSearchSymbol(symbol.trim());
+  const picked = __pickExactSymbolPreferVerified(list, symbol);
+  return { mint: picked.id, dec: picked.decimals ?? 0, meta: picked };
+}
+
+// ---------------- PUBLIC API ----------------
+
+/** Цена(ы) по mint(ам). По умолчанию в USDC. */
+export async function getPricesByMint(mintOrMints, opt = {}) {
+  const jax = __createPriceClient({});
+  const ids = Array.isArray(mintOrMints) ? mintOrMints : [mintOrMints];
+
+  // vsToken может быть символом — попробуем резолвнуть в mint
+  let vsTokenId = opt.vsToken || "USDC";
+  if (vsTokenId && vsTokenId.length < 32) {
+    try {
+      const vs = await __resolveMintBySymbol(vsTokenId);
+      vsTokenId = vs.mint;
+    } catch {
+      /* игнор, Jupiter вернёт дефолтные валюты */
+    }
+  }
+
+  const { data } = await jax.get("/v3/price", {
+    params: {
+      ids: ids.join(","),
+      ...(vsTokenId ? { vsToken: vsTokenId } : {}),
+      ...(opt.vsAmount ? { vsAmount: opt.vsAmount } : {}),
+      ...(opt.onlyVsToken ? { onlyVsToken: true } : {}),
+    },
+  });
+
+  return data?.data || {};
+}
+
+/** Цена по символу (например 'SOL'/'BONK'). */
+export async function getPriceBySymbol(symbol, opt = {}) {
+  const { mint } = await __resolveMintBySymbol(symbol);
+  const res = await getPricesByMint(mint, opt);
+  return res[mint] || null;
+}
+
+/** Батч-цены по символам — вернёт массив в исходном порядке. */
+export async function getPricesBySymbols(symbols, opt = {}) {
+  const mints = await Promise.all(symbols.map(__resolveMintBySymbol));
+  const byMint = await getPricesByMint(
+    mints.map((m) => m.mint),
+    opt
+  );
+  return mints.map(({ mint, meta }) => ({
+    symbol: meta.symbol,
+    mint,
+    ...(byMint[mint] || {}),
+  }));
+}
+
+/** Изменение цены за период: "24h" | "7d" | "30d". */
+export async function getPriceChanges(mints, interval = "24h") {
+  const jax = __createPriceClient({});
+  const { data } = await jax.get("/v3/price-changes", {
+    params: {
+      ids: (Array.isArray(mints) ? mints : [mints]).join(","),
+      interval,
+    },
+  });
+  return data?.data || {};
+}
+// ============================================================================
+// Примеры вызова:
+// const p1 = await getPriceBySymbol("BONK", { vsToken: "USDC", onlyVsToken: true });
+// const p2 = await getPricesBySymbols(["SOL","USDT","BONK"], { vsToken: "USDC" });
+// const ch = await getPriceChanges(["So11111111111111111111111111111111111111112"], "24h");
