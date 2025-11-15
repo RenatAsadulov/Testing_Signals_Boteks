@@ -572,9 +572,10 @@ export async function executeSwapQuote(quoteResponse, opt = {}) {
 
 export { toRawAmount };
 
-// ====== Jupiter Price API (drop-in) ========================================
+// ====== Jupiter Price API (Lite implementation based on dev docs) ==========
 // Требуются axios и https уже импортированные в файле.
-// Опциональные ENV: PRICE_HOST=price.jup.ag, PRICE_IP=<ip>
+// Кастомизация через ENV: PRICE_HOST, PRICE_IP, PRICE_BASE_URL, PRICE_TIMEOUT_MS,
+// PRICE_BATCH_SIZE, PRICE_DEFAULT_VS_TOKEN.
 
 const __PRICE_HEADERS =
   typeof COMMON_HEADERS !== "undefined"
@@ -586,28 +587,112 @@ const __PRICE_HEADERS =
         referer: "https://jup.ag/",
       };
 
-const { PRICE_HOST = "price.jup.ag", PRICE_IP: PRICE_IP_ENV } = process.env;
-const PRICE_IP = PRICE_IP_ENV || JUPITER_IP || undefined;
+const {
+  PRICE_HOST: PRICE_HOST_ENV = "price.jup.ag",
+  PRICE_IP: PRICE_IP_ENV,
+  PRICE_BASE_URL: PRICE_BASE_URL_ENV,
+  PRICE_TIMEOUT_MS: PRICE_TIMEOUT_MS_ENV,
+  PRICE_BATCH_SIZE: PRICE_BATCH_SIZE_ENV,
+  PRICE_DEFAULT_VS_TOKEN: PRICE_DEFAULT_VS_TOKEN_ENV,
+} = process.env;
 
-function __createPriceClient({ host = PRICE_HOST, ip = PRICE_IP } = {}) {
-  if (ip) {
-    return axios.create({
-      baseURL: `https://${ip}`,
-      httpsAgent: new https.Agent({
-        family: 4,
-        keepAlive: false,
-        servername: host,
-      }),
-      headers: { ...__PRICE_HEADERS, host },
-      timeout: 15000,
+const PRICE_TIMEOUT_MS = Number(PRICE_TIMEOUT_MS_ENV) || 15000;
+const PRICE_BATCH_SIZE = Math.max(
+  1,
+  Math.min(Number(PRICE_BATCH_SIZE_ENV) || 100, 200)
+);
+
+let __priceHostCandidate = PRICE_HOST_ENV || "";
+if (!__priceHostCandidate && PRICE_BASE_URL_ENV) {
+  try {
+    const parsed = new URL(PRICE_BASE_URL_ENV);
+    if (parsed.hostname) {
+      __priceHostCandidate = parsed.hostname;
+    }
+  } catch {
+    // ignore invalid PRICE_BASE_URL
+  }
+}
+const __priceHost = (__priceHostCandidate || "price.jup.ag").replace(/^https?:\/\//, "");
+const PRICE_IP = (PRICE_IP_ENV || JUPITER_IP || "").trim() || undefined;
+const PRICE_BASE_URL = (PRICE_BASE_URL_ENV || "")
+  .trim()
+  .replace(/\/$/, "");
+const PRICE_DEFAULT_VS_TOKEN = PRICE_DEFAULT_VS_TOKEN_ENV || "USDC";
+
+function __createPriceAxios({ baseURL, hostHeader }) {
+  const agentOptions = { keepAlive: true };
+  if (hostHeader) {
+    agentOptions.servername = hostHeader;
+  }
+
+  return axios.create({
+    baseURL,
+    timeout: PRICE_TIMEOUT_MS,
+    httpsAgent: new https.Agent(agentOptions),
+    headers: hostHeader
+      ? { ...__PRICE_HEADERS, host: hostHeader }
+      : { ...__PRICE_HEADERS },
+  });
+}
+
+function __buildPriceClients() {
+  const clients = [];
+
+  if (PRICE_IP) {
+    const baseURL = `https://${PRICE_IP}`;
+    clients.push({
+      tag: "ip",
+      client: __createPriceAxios({ baseURL, hostHeader: __priceHost }),
     });
   }
-  return axios.create({
-    baseURL: `https://${host}`,
-    httpsAgent: new https.Agent({ family: 4, keepAlive: false }),
-    headers: { ...__PRICE_HEADERS },
-    timeout: 15000,
+
+  const hostBase = PRICE_BASE_URL || `https://${__priceHost}`;
+  clients.push({
+    tag: "host",
+    client: __createPriceAxios({ baseURL: hostBase, hostHeader: undefined }),
   });
+
+  return clients;
+}
+
+const __PRICE_CLIENTS = __buildPriceClients();
+
+function __isRetriablePriceError(err) {
+  if (!err) return false;
+  if (err.code && ["ECONNRESET", "ENOTFOUND", "ECONNREFUSED", "EAI_AGAIN"].includes(err.code)) {
+    return true;
+  }
+  const status = err?.response?.status;
+  if (!status) return true;
+  if (status === 408 || status === 425 || status === 429) return true;
+  return status >= 500 && status < 600;
+}
+
+async function __requestPrice(path, params, { label, signal } = {}) {
+  if (!__PRICE_CLIENTS.length) {
+    throw new Error("Price clients are not configured");
+  }
+
+  let lastErr;
+  for (let idx = 0; idx < __PRICE_CLIENTS.length; idx += 1) {
+    const { client, tag } = __PRICE_CLIENTS[idx];
+    try {
+      return await client.get(path, { params, signal });
+    } catch (err) {
+      lastErr = err;
+      const retriable = __isRetriablePriceError(err);
+      const isLast = idx === __PRICE_CLIENTS.length - 1;
+      if (!retriable || isLast) {
+        throw err;
+      }
+      console.warn(
+        `${label || path} failed on price client (${tag}); retrying with fallback:`,
+        err?.message || err
+      );
+    }
+  }
+  throw lastErr;
 }
 
 // ---- Tokens v2 search (используем существующий TOKENS_AX, если он есть)
@@ -616,7 +701,7 @@ const __TOK_AX =
     ? TOKENS_AX
     : axios.create({
         baseURL: "https://lite-api.jup.ag",
-        httpsAgent: new https.Agent({ family: 4, keepAlive: false }),
+        httpsAgent: new https.Agent({ keepAlive: true }),
         headers: { ...__PRICE_HEADERS },
         timeout: 15000,
       });
@@ -646,121 +731,133 @@ async function __resolveMintBySymbol(symbol) {
   return { mint: picked.id, dec: picked.decimals ?? 0, meta: picked };
 }
 
+function __chunk(array, size) {
+  const chunks = [];
+  for (let i = 0; i < array.length; i += size) {
+    chunks.push(array.slice(i, i + size));
+  }
+  return chunks;
+}
+
+const __vsTokenCache = new Map();
+
+async function __ensureVsTokenId(vsToken) {
+  if (!vsToken) return null;
+  if (vsToken.length >= 32) return vsToken;
+  const key = vsToken.toUpperCase();
+  if (__vsTokenCache.has(key)) return __vsTokenCache.get(key);
+  try {
+    const resolved = await __resolveMintBySymbol(vsToken);
+    __vsTokenCache.set(key, resolved.mint);
+    return resolved.mint;
+  } catch {
+    __vsTokenCache.set(key, vsToken);
+    return vsToken;
+  }
+}
+
+function __normalizeVsCandidates(primary, extras, includeNull = true) {
+  const seen = new Set();
+  const ordered = [];
+
+  function push(value) {
+    const key = value ?? "__null__";
+    if (seen.has(key)) return;
+    seen.add(key);
+    ordered.push(value ?? null);
+  }
+
+  if (primary !== undefined) {
+    push(primary);
+  }
+
+  for (const extra of extras || []) {
+    if (extra === undefined) continue;
+    push(extra);
+  }
+
+  if (includeNull) {
+    push(null);
+  }
+
+  return ordered;
+}
+
 // ---------------- PUBLIC API ----------------
 
 /** Цена(ы) по mint(ам). По умолчанию в USDC. */
 export async function getPricesByMint(mintOrMints, opt = {}) {
-  const ids = Array.isArray(mintOrMints) ? mintOrMints : [mintOrMints];
+  const ids = (Array.isArray(mintOrMints) ? mintOrMints : [mintOrMints])
+    .map((id) => String(id || "").trim())
+    .filter(Boolean);
   if (!ids.length) return {};
 
   const fallbackVsTokens = Array.isArray(opt.fallbackVsTokens)
-    ? opt.fallbackVsTokens
+    ? opt.fallbackVsTokens.filter((v) => v !== undefined)
     : [];
 
-  const priceClients = PRICE_IP
-    ? [
-        { client: __createPriceClient({ host: PRICE_HOST, ip: PRICE_IP }), tag: "ip" },
-        { client: __createPriceClient({ host: PRICE_HOST, ip: undefined }), tag: "host" },
-      ]
-    : [{ client: __createPriceClient({ host: PRICE_HOST, ip: undefined }), tag: "host" }];
+  const vsCandidates = __normalizeVsCandidates(
+    opt.vsToken !== undefined ? opt.vsToken : PRICE_DEFAULT_VS_TOKEN,
+    fallbackVsTokens,
+    opt.allowNoVsToken !== false
+  );
 
-  async function requestWithPriceClients(run, label) {
-    let lastErr;
-    for (let idx = 0; idx < priceClients.length; idx += 1) {
-      const { client, tag } = priceClients[idx];
-      try {
-        return await run(client);
-      } catch (err) {
-        lastErr = err;
-        const status = err?.response?.status;
-        const retriable =
-          !err?.response ||
-          status === 0 ||
-          status === 408 ||
-          status === 425 ||
-          status === 429 ||
-          (status >= 500 && status < 600);
-        const isLast = idx === priceClients.length - 1;
-        if (!retriable || isLast) {
-          throw err;
-        }
-        console.warn(
-          `${label} failed on price client (${tag}); retrying with fallback:`,
-          err?.message || err
-        );
-      }
-    }
-    throw lastErr;
-  }
+  const uniqueIds = [...new Set(ids)];
+  const remaining = new Set(uniqueIds);
+  const prices = {};
 
-  async function fetchForVsToken(vsTokenSymbolOrMint) {
-    if (!vsTokenSymbolOrMint) {
-      const { data } = await requestWithPriceClients(
-        (client) =>
-          client.get("/v3/price", {
-            params: { ids: ids.join(",") },
-          }),
-        "Primary price fetch"
+  for (const vsCandidate of vsCandidates) {
+    if (!remaining.size) break;
+
+    let vsTokenId = vsCandidate;
+    try {
+      vsTokenId = await __ensureVsTokenId(vsCandidate);
+    } catch (err) {
+      console.warn(
+        `Failed to resolve vsToken ${vsCandidate}:`,
+        err?.message || err
       );
-      return data?.data || {};
+      continue;
     }
 
-    let vsTokenId = vsTokenSymbolOrMint;
-    if (vsTokenId.length < 32) {
+    const chunks = __chunk(Array.from(remaining), PRICE_BATCH_SIZE);
+    for (const chunk of chunks) {
+      const params = {
+        ids: chunk.join(","),
+        ...(vsTokenId ? { vsToken: vsTokenId } : {}),
+        ...(opt.vsAmount ? { vsAmount: opt.vsAmount } : {}),
+        ...(opt.onlyVsToken ? { onlyVsToken: true } : {}),
+        ...(opt.showExtraInfo ?? true ? { showExtraInfo: true } : {}),
+      };
+
       try {
-        const resolved = await __resolveMintBySymbol(vsTokenId);
-        vsTokenId = resolved.mint;
-      } catch {
-        // если не получилось резолвнуть символ — пробуем как есть
-      }
-    }
-
-    const { data } = await requestWithPriceClients(
-      (client) =>
-        client.get("/v3/price", {
-          params: {
-            ids: ids.join(","),
-            vsToken: vsTokenId,
-            ...(opt.vsAmount ? { vsAmount: opt.vsAmount } : {}),
-            ...(opt.onlyVsToken ? { onlyVsToken: true } : {}),
-          },
-        }),
-      `Fallback price fetch for ${vsTokenSymbolOrMint}`
-    );
-
-    return data?.data || {};
-  }
-
-  let priceMap = {};
-  try {
-    priceMap = await fetchForVsToken(opt.vsToken || "USDC");
-  } catch (err) {
-    console.warn("Primary price fetch failed:", err?.message || err);
-  }
-
-  let missing = ids.filter((id) => !priceMap[id]);
-  if (missing.length && fallbackVsTokens.length) {
-    for (const fallbackVs of fallbackVsTokens) {
-      try {
-        const extra = await fetchForVsToken(fallbackVs);
-        for (const id of missing) {
-          if (extra[id] && !priceMap[id]) {
-            priceMap[id] = extra[id];
+        const { data } = await __requestPrice(
+          "/v3/price",
+          params,
+          {
+            label: `Price fetch vs ${vsCandidate || "default"}`,
+            signal: opt.signal,
+          }
+        );
+        const map = data?.data || {};
+        for (const id of chunk) {
+          const info = map[id];
+          if (info && !prices[id]) {
+            prices[id] = info;
+            remaining.delete(id);
           }
         }
-        missing = missing.filter((id) => !priceMap[id]);
-        if (!missing.length) break;
       } catch (err) {
         console.warn(
-          "Fallback price fetch failed for",
-          fallbackVs,
+          `Price fetch failed for vsToken=${vsCandidate || "default"}:`,
           err?.message || err
         );
+        break;
       }
     }
   }
 
-  return priceMap;
+  return prices;
 }
 
 /** Цена по символу (например 'SOL'/'BONK'). */
@@ -786,13 +883,19 @@ export async function getPricesBySymbols(symbols, opt = {}) {
 
 /** Изменение цены за период: "24h" | "7d" | "30d". */
 export async function getPriceChanges(mints, interval = "24h") {
-  const jax = __createPriceClient({});
-  const { data } = await jax.get("/v3/price-changes", {
-    params: {
-      ids: (Array.isArray(mints) ? mints : [mints]).join(","),
+  const ids = (Array.isArray(mints) ? mints : [mints])
+    .map((id) => String(id || "").trim())
+    .filter(Boolean);
+  if (!ids.length) return {};
+
+  const { data } = await __requestPrice(
+    "/v3/price-changes",
+    {
+      ids: ids.join(","),
       interval,
     },
-  });
+    { label: "Price changes fetch" }
+  );
   return data?.data || {};
 }
 // ============================================================================
