@@ -574,8 +574,6 @@ export { toRawAmount };
 
 // ====== Jupiter Price API (Lite implementation based on dev docs) ==========
 // Требуются axios и https уже импортированные в файле.
-// Кастомизация через ENV: PRICE_HOST, PRICE_IP, PRICE_BASE_URL, PRICE_TIMEOUT_MS,
-// PRICE_BATCH_SIZE, PRICE_DEFAULT_VS_TOKEN.
 
 const __PRICE_HEADERS =
   typeof COMMON_HEADERS !== "undefined"
@@ -587,70 +585,25 @@ const __PRICE_HEADERS =
         referer: "https://jup.ag/",
       };
 
-const {
-  PRICE_HOST: PRICE_HOST_ENV = "price.jup.ag",
-  PRICE_IP: PRICE_IP_ENV,
-  PRICE_BASE_URL: PRICE_BASE_URL_ENV,
-  PRICE_TIMEOUT_MS: PRICE_TIMEOUT_MS_ENV,
-  PRICE_BATCH_SIZE: PRICE_BATCH_SIZE_ENV,
-  PRICE_DEFAULT_VS_TOKEN: PRICE_DEFAULT_VS_TOKEN_ENV,
-} = process.env;
+const PRICE_BASE_URL = "https://lite-api.jup.ag"; // TODO: вынести в .env, когда появится необходимость менять маршрут
+const PRICE_TIMEOUT_MS = 15000;
+const PRICE_BATCH_SIZE = 100;
+const PRICE_DEFAULT_VS_TOKEN = "USDC";
 
-const PRICE_TIMEOUT_MS = Number(PRICE_TIMEOUT_MS_ENV) || 15000;
-const PRICE_BATCH_SIZE = Math.max(
-  1,
-  Math.min(Number(PRICE_BATCH_SIZE_ENV) || 100, 200)
-);
-
-let __priceHostCandidate = PRICE_HOST_ENV || "";
-if (!__priceHostCandidate && PRICE_BASE_URL_ENV) {
-  try {
-    const parsed = new URL(PRICE_BASE_URL_ENV);
-    if (parsed.hostname) {
-      __priceHostCandidate = parsed.hostname;
-    }
-  } catch {
-    // ignore invalid PRICE_BASE_URL
-  }
-}
-const __priceHost = (__priceHostCandidate || "price.jup.ag").replace(/^https?:\/\//, "");
-const PRICE_IP = (PRICE_IP_ENV || JUPITER_IP || "").trim() || undefined;
-const PRICE_BASE_URL = (PRICE_BASE_URL_ENV || "")
-  .trim()
-  .replace(/\/$/, "");
-const PRICE_DEFAULT_VS_TOKEN = PRICE_DEFAULT_VS_TOKEN_ENV || "USDC";
-
-function __createPriceAxios({ baseURL, hostHeader }) {
-  const agentOptions = { keepAlive: true };
-  if (hostHeader) {
-    agentOptions.servername = hostHeader;
-  }
-
+function __createPriceAxios(baseURL) {
   return axios.create({
     baseURL,
     timeout: PRICE_TIMEOUT_MS,
-    httpsAgent: new https.Agent(agentOptions),
-    headers: hostHeader
-      ? { ...__PRICE_HEADERS, host: hostHeader }
-      : { ...__PRICE_HEADERS },
+    httpsAgent: new https.Agent({ keepAlive: true }),
+    headers: { ...__PRICE_HEADERS },
   });
 }
 
 function __buildPriceClients() {
   const clients = [];
-
-  if (PRICE_IP) {
-    const baseURL = `https://${PRICE_IP}`;
-    clients.push({
-      tag: "ip",
-      client: __createPriceAxios({ baseURL, hostHeader: __priceHost }),
-    });
-  }
-
-  const hostBase = PRICE_BASE_URL || `https://${__priceHost}`;
   clients.push({
-    tag: "host",
-    client: __createPriceAxios({ baseURL: hostBase, hostHeader: undefined }),
+    tag: "lite-host",
+    client: __createPriceAxios(PRICE_BASE_URL),
   });
 
   return clients;
