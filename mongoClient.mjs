@@ -2,8 +2,6 @@ import { MongoClient } from "mongodb";
 
 const MONGODB_URI = process.env.MONGODB_URI || "";
 const MONGODB_DB = process.env.MONGODB_DB || "";
-const ACTIONS_COLLECTION =
-  process.env.MONGODB_ACTIONS_COLLECTION || "botUserActions";
 const STATE_COLLECTION =
   process.env.MONGODB_STATE_COLLECTION || "botState";
 
@@ -47,7 +45,6 @@ export async function initMongo() {
     const db = await getDb();
     if (!db) return false;
     await Promise.all([
-      db.collection(ACTIONS_COLLECTION).createIndex({ createdAt: -1 }),
       db.collection(STATE_COLLECTION).createIndex({ updatedAt: -1 }),
       db
         .collection(STATE_COLLECTION)
@@ -75,15 +72,6 @@ function withMongoGuard(fn) {
     }
   };
 }
-
-export const logUserAction = withMongoGuard(async (db, payload) => {
-  if (!payload || typeof payload !== "object") return null;
-  const entry = {
-    ...payload,
-    createdAt: payload.createdAt ? new Date(payload.createdAt) : new Date(),
-  };
-  return db.collection(ACTIONS_COLLECTION).insertOne(entry);
-});
 
 const HISTORY_LIMIT = 50;
 

@@ -5,7 +5,6 @@ import path from "node:path";
 import { recordWalletSnapshot } from "./walletStatistics.mjs";
 import {
   initMongo,
-  logUserAction,
   mongoConfigured,
   mongoIsActive,
   saveSettingsDocument,
@@ -56,14 +55,6 @@ if (!mongoReady) {
 const bot = new Telegraf(BOT_TOKEN);
 
 bot.use(session());
-bot.use(async (ctx, next) => {
-  if (ctx?.from) {
-    await recordAction(ctx, `update:${ctx.updateType || "unknown"}`, {
-      updateId: ctx.update?.update_id,
-    });
-  }
-  return next();
-});
 
 function getUserContext(ctx) {
   const from = ctx?.from;
@@ -76,50 +67,6 @@ function getUserContext(ctx) {
     lastName: from.last_name || null,
     languageCode: from.language_code || null,
   };
-}
-
-function getChatContext(ctx) {
-  const chat = ctx?.chat;
-  if (!chat) return null;
-  return {
-    id: chat.id,
-    type: chat.type,
-    title: chat.title || null,
-    username: chat.username || null,
-  };
-}
-
-async function recordAction(ctx, action, details = {}) {
-  if (!mongoIsActive()) return;
-  try {
-    await logUserAction({
-      action,
-      details,
-      user: getUserContext(ctx),
-      chat: getChatContext(ctx),
-      message: ctx?.message
-        ? {
-            id: ctx.message.message_id,
-            text:
-              typeof ctx.message.text === "string"
-                ? ctx.message.text.slice(0, 4096)
-                : undefined,
-            viaBot: ctx.message.via_bot?.id,
-          }
-        : null,
-      callbackQuery: ctx?.callbackQuery
-        ? {
-            id: ctx.callbackQuery.id,
-            data: ctx.callbackQuery.data
-              ? String(ctx.callbackQuery.data).slice(0, 1024)
-              : undefined,
-          }
-        : null,
-      createdAt: new Date().toISOString(),
-    });
-  } catch (err) {
-    console.error("Failed to log user action:", err);
-  }
 }
 
 async function syncSettingsSnapshot(reason, ctx) {
@@ -585,10 +532,6 @@ async function handleSellCallback(ctx, data) {
   const action = parts[1];
   const payload = parts.slice(2).join(":");
 
-  await recordAction(ctx, `buy:${action}`, { payload });
-
-  await recordAction(ctx, `sell:${action}`, { payload });
-
   if (action === "token") {
     const token = flow.tokens?.[payload];
     if (!token) {
@@ -601,11 +544,6 @@ async function handleSellCallback(ctx, data) {
       );
       return;
     }
-    await recordAction(ctx, "sell:token:selected", {
-      mint: token.mint,
-      symbol: token.symbol,
-      valueUsdt: token.valueUsdt,
-    });
     flow.selectedToken = token;
     flow.stage = "chooseTarget";
     const buttons = [
@@ -628,10 +566,6 @@ async function handleSellCallback(ctx, data) {
     const targetSymbol = payload.toUpperCase();
     try {
       flow.target = await getSellTarget(targetSymbol);
-      await recordAction(ctx, "sell:target:selected", {
-        targetSymbol: flow.target.symbol,
-        targetMint: flow.target.mint,
-      });
     } catch (e) {
       await ctx.reply("Не удалось подготовить целевой токен: " + e.message);
       return;
@@ -667,14 +601,6 @@ async function handleSellCallback(ctx, data) {
           ? Number(flow.quote.outAmount) / 10 ** flow.target.decimals
           : null;
       await Promise.allSettled([
-        recordAction(ctx, "sell:confirm:success", {
-          transactionSignature: sig,
-          tokenMint: flow.selectedToken?.mint,
-          tokenSymbol: flow.selectedToken?.symbol,
-          amountUi: Number.isFinite(amountUiNumber) ? amountUiNumber : null,
-          amountOutUi: Number.isFinite(outAmountUi) ? outAmountUi : null,
-          targetSymbol: flow.target?.symbol,
-        }),
         trackTokenAction(ctx, {
           tokenMint: flow.selectedToken?.mint,
           tokenSymbol: flow.selectedToken?.symbol,
@@ -724,8 +650,6 @@ async function handleBuyCallback(ctx, data) {
   const action = parts[1];
   const payload = parts.slice(2).join(":");
 
-  await recordAction(ctx, `buy:${action}`, { payload });
-
   if (action === "pay") {
     if (!flow.targetToken) {
       await ctx.reply("Сначала выберите токен для покупки.");
@@ -743,11 +667,6 @@ async function handleBuyCallback(ctx, data) {
       return;
     }
     flow.paymentToken = token;
-    await recordAction(ctx, "buy:payment-selected", {
-      mint: token.mint,
-      symbol: token.symbol,
-      balance: token.uiAmount,
-    });
     flow.stage = "awaiting_amount";
     const availableAmount = formatAmount(token.uiAmount);
     const availableValue = formatUsd(token.valueUsdt);
@@ -779,18 +698,6 @@ async function handleBuyCallback(ctx, data) {
           ? Number(flow.quote.outAmount) / 10 ** flow.targetToken.decimals
           : null;
       await Promise.allSettled([
-        recordAction(ctx, "buy:confirm:success", {
-          transactionSignature: sig,
-          paymentMint: flow.paymentToken?.mint,
-          paymentSymbol: flow.paymentToken?.symbol,
-          paymentAmountUi: Number.isFinite(paymentAmountUi)
-            ? paymentAmountUi
-            : null,
-          receivedAmountUi: Number.isFinite(receivedAmountUi)
-            ? receivedAmountUi
-            : null,
-          targetSymbol: flow.targetToken?.symbol,
-        }),
         trackTokenAction(ctx, {
           tokenMint: flow.targetToken?.mint,
           tokenSymbol: flow.targetToken?.symbol,
@@ -858,7 +765,6 @@ async function processBuyMessage(ctx) {
       await ctx.reply("Введите символ токена, например PEPE или $PEPE.");
       return true;
     }
-    await recordAction(ctx, "buy:symbol", { symbol });
     try {
       const target = await getBuyTarget(symbol);
       flow.targetToken = target;
@@ -921,11 +827,6 @@ async function processBuyMessage(ctx) {
       await ctx.reply("Недостаточно токенов на балансе.");
       return true;
     }
-
-    await recordAction(ctx, "buy:amount", {
-      amountUi,
-      rawText,
-    });
 
     try {
       const quote = await getSwapQuote({
@@ -1000,11 +901,6 @@ async function processSellAmount(ctx) {
     return true;
   }
 
-  await recordAction(ctx, "sell:amount", {
-    amountUi,
-    rawText,
-  });
-
   try {
     const quote = await getSwapQuote({
       inputMint: flow.selectedToken.mint,
@@ -1022,23 +918,9 @@ async function processSellAmount(ctx) {
     const minOut = quote?.otherAmountThreshold
       ? Number(quote.otherAmountThreshold) / 10 ** flow.target.decimals
       : null;
-      const priceImpact = quote?.priceImpactPct
-        ? Number(quote.priceImpactPct) * 100
-        : null;
-
-      await recordAction(ctx, "buy:quote", {
-        amountUi,
-        outAmount,
-        minOut,
-        priceImpact,
-      });
-
-    await recordAction(ctx, "sell:quote", {
-      amountUi,
-      outAmount,
-      minOut,
-      priceImpact,
-    });
+    const priceImpact = quote?.priceImpactPct
+      ? Number(quote.priceImpactPct) * 100
+      : null;
 
     const lines = [
       "Предпросмотр сделки",
@@ -1141,7 +1023,6 @@ function numericPromptText(field, value) {
 
 async function beginNumericEdit(ctx, field) {
   const info = NUMERIC_EDIT_FIELDS[field];
-  await recordAction(ctx, "settings:edit:start", { field });
   const s = await store.getAll();
   const initial = info.toDisplay(s[field]);
   ctx.session ??= {};
@@ -1168,10 +1049,6 @@ async function handleNumericCallback(ctx, action) {
   if (!edit) return;
   const message = ctx.callbackQuery.message;
   if (!message || message.message_id !== edit.messageId) return;
-  await recordAction(ctx, `settings:edit:${action}`, {
-    field: edit.field,
-    buffer: edit.buffer,
-  });
   if (action === "cancel") {
     ctx.session.numericEdit = null;
     await ctx.editMessageText("Отменено").catch(() => {});
@@ -1213,7 +1090,6 @@ async function handleNumericCallback(ctx, action) {
 }
 
 bot.start(async (ctx) => {
-  await recordAction(ctx, "command:start");
   await ctx.reply(
     "Hello! Here you can config *token*, *amount* и *market cap*.", // TODO update text
     {
@@ -1224,22 +1100,18 @@ bot.start(async (ctx) => {
 });
 
 bot.command("settings", async (ctx) => {
-  await recordAction(ctx, "command:settings");
   await replyWithSettings(ctx);
 });
 
 bot.hears("Sell", async (ctx) => {
-  await recordAction(ctx, "menu:sell");
   await handleSellStart(ctx);
 });
 
 bot.hears("Buy", async (ctx) => {
-  await recordAction(ctx, "menu:buy");
   await handleBuyStart(ctx);
 });
 
 bot.hears("Statistics", async (ctx) => {
-  await recordAction(ctx, "menu:statistics");
   try {
     await ctx.sendChatAction?.("typing");
     const tokensRaw = await fetchWalletTokens({ vsToken: SELL_PRICE_VS });
@@ -1347,7 +1219,6 @@ bot.hears("Statistics", async (ctx) => {
 });
 
 bot.command("get", async (ctx) => {
-  await recordAction(ctx, "command:get");
   const s = await store.getAll();
   await ctx.replyWithMarkdown(
     `\- token: \`${s.token}\`\n` +
@@ -1357,9 +1228,6 @@ bot.command("get", async (ctx) => {
 });
 
 bot.command("set", async (ctx) => {
-  await recordAction(ctx, "command:set", {
-    text: ctx.message?.text,
-  });
   try {
     // assertOwner(ctx);
     const [, key, ...rest] = (ctx.message.text || "").split(/\s+/);
@@ -1367,20 +1235,17 @@ bot.command("set", async (ctx) => {
     if (!key || !value)
       return ctx.reply("Use: /set <token|amount|marketCapMinimum> <value>");
     if (key === "token") {
-      await recordAction(ctx, "command:set:token", { value });
       await store.setToken(value);
       await syncSettingsSnapshot("update:token", ctx);
     } else if (key === "amount") {
       const n = Number(value);
       if (!Number.isFinite(n)) return ctx.reply("amount should be a number");
-      await recordAction(ctx, "command:set:amount", { value: n });
       await store.setAmount(n);
       await syncSettingsSnapshot("update:amount", ctx);
     } else if (key === "marketCapMinimum") {
       const n = Number(value);
       if (!Number.isFinite(n) || n < 0)
         return ctx.reply("marketCapMinimum should be a non-negative number");
-      await recordAction(ctx, "command:set:marketCapMinimum", { value: n });
       await store.setMarketCapMinimum(n);
       await syncSettingsSnapshot("update:marketCapMinimum", ctx);
     } else {
@@ -1409,7 +1274,6 @@ bot.on("callback_query", async (ctx) => {
       return;
     }
     if (data === "export") {
-      await recordAction(ctx, "callback:export");
       await ctx.answerCbQuery();
       await ctx.replyWithDocument({
         source: path.resolve(SETTINGS_FILE),
@@ -1419,7 +1283,6 @@ bot.on("callback_query", async (ctx) => {
     }
     if (!data.startsWith("edit:")) return;
     const key = data.split(":")[1];
-    await recordAction(ctx, "callback:edit", { key });
     if (NUMERIC_EDIT_FIELDS[key]) {
       await ctx.answerCbQuery();
       await beginNumericEdit(ctx, key);
@@ -1455,7 +1318,6 @@ bot.on("message", async (ctx, next) => {
   try {
     const raw = ctx.message.text.trim();
     if (key === "token") {
-      await recordAction(ctx, "settings:token:set", { value: raw });
       await store.setToken(raw);
       await syncSettingsSnapshot("update:token", ctx);
     }
