@@ -43,6 +43,33 @@ function makeKeyboard(settings) {
   return Markup.inlineKeyboard(rows);
 }
 
+function makeMainMenuKeyboard() {
+  return Markup.keyboard(
+    [
+      ["Sell", "Buy"],
+      ["Statistics", "Configuration"],
+      ["Trade-Bot"],
+    ],
+    { columns: 2 }
+  )
+    .resize()
+    .persistent();
+}
+
+function hasSettings(settings) {
+  return Boolean(
+    settings && typeof settings === "object" && Object.keys(settings).length
+  );
+}
+
+async function replyWithSettings(ctx) {
+  const s = await store.getAll();
+  await ctx.reply("Current values:", makeKeyboard(s));
+  if (hasSettings(s)) {
+    await ctx.reply("Trade-Bot", makeMainMenuKeyboard());
+  }
+}
+
 const NUMERIC_EDIT_FIELDS = {
   amount: {
     title: "Swap amount",
@@ -147,8 +174,7 @@ async function handleNumericCallback(ctx, action) {
         `Сохранено: ${info.title} = ${persisted}`,
         { parse_mode: "Markdown" }
       );
-      const s = await store.getAll();
-      await ctx.reply("Current values:", makeKeyboard(s));
+      await replyWithSettings(ctx);
     } catch (e) {
       await ctx.reply("Error: " + e.message).catch(() => {});
     }
@@ -174,13 +200,11 @@ bot.start(async (ctx) => {
       parse_mode: "Markdown",
     }
   );
-  const s = await store.getAll();
-  await ctx.reply("Current values:", makeKeyboard(s));
+  await replyWithSettings(ctx);
 });
 
 bot.command("settings", async (ctx) => {
-  const s = await store.getAll();
-  await ctx.reply("Current values:", makeKeyboard(s));
+  await replyWithSettings(ctx);
 });
 
 bot.command("get", async (ctx) => {
@@ -213,9 +237,8 @@ bot.command("set", async (ctx) => {
     } else {
       return ctx.reply("Available keys: token, amount, marketCapMinimum");
     }
-    const s = await store.getAll();
     await ctx.reply("Saved ✅");
-    await ctx.reply("Current values:", makeKeyboard(s));
+    await replyWithSettings(ctx);
   } catch (e) {
     await ctx.reply("Ошибка: " + e.message);
   }
@@ -270,9 +293,8 @@ bot.on("message", async (ctx, next) => {
       await store.setToken(raw);
     }
     ctx.session.editKey = null;
-    const s = await store.getAll();
     await ctx.reply("Saved ✅");
-    await ctx.reply("Current values:", makeKeyboard(s));
+    await replyWithSettings(ctx);
   } catch (e) {
     await ctx.reply("Error: " + e.message + "\n Try again or use /settings");
   }
