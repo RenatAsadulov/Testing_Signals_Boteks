@@ -152,28 +152,19 @@ async function trackTokenAction(ctx, payload) {
 }
 
 function makeKeyboard(settings) {
-  const amountLabel =
-    `Сумма сделки: ${formatTradeAmount(settings.amount)}` +
-    (settings.token ? ` ${settings.token}` : "");
+  const currencyLabel = `Currency: ${settings.token || "not set"}`;
+  const profitTargetLabel = `Profit target: ${formatPercent(
+    settings.profitTargetPercent
+  )}`;
+  const amountParts = [`Amount: ${formatTradeAmount(settings.amount)}`];
+  if (settings.token) {
+    amountParts.push(settings.token);
+  }
+  const amountLabel = amountParts.join(" ");
   const rows = [
-    [
-      Markup.button.callback(
-        `Валюта: ${settings.token || "не выбрано"}`,
-        "edit:token"
-      ),
-    ],
-    [
-      Markup.button.callback(
-        `Цель по прибыли: ${formatPercent(settings.profitTargetPercent)}`,
-        "edit:profitTargetPercent"
-      ),
-    ],
-    [
-      Markup.button.callback(
-        amountLabel,
-        "edit:amount"
-      ),
-    ],
+    [Markup.button.callback(currencyLabel, "edit:token")],
+    [Markup.button.callback(profitTargetLabel, "edit:profitTargetPercent")],
+    [Markup.button.callback(amountLabel, "edit:amount")],
     [Markup.button.callback("📤 Export JSON", "export")],
   ];
   return Markup.inlineKeyboard(rows);
@@ -985,16 +976,10 @@ function hasSettings(settings) {
 
 async function replyWithSettings(ctx) {
   const s = await store.getAll();
-  const amountLine =
-    `• Сумма сделки: ${formatTradeAmount(s.amount)}` +
-    (s.token ? ` ${s.token}` : "");
-  const lines = [
-    "⚙️ Настройки трейд-бота:",
-    `• Валюта: ${s.token || "не выбрано"}`,
-    `• Цель по прибыли: ${formatPercent(s.profitTargetPercent)}`,
-    amountLine,
-  ];
-  await ctx.reply(lines.join("\n"), makeKeyboard(s));
+  await ctx.reply(
+    "⚙️ Настройте трейд-бота: выберите параметр ниже.",
+    makeKeyboard(s)
+  );
 }
 
 const NUMERIC_EDIT_FIELDS = {
