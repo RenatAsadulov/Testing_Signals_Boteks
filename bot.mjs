@@ -122,9 +122,9 @@ async function handleSellStart(ctx) {
 
     const tokenMap = {};
     const rows = tokens.map((token) => {
-      const symbol = token.symbol || token.mint.slice(0, 6);
-      tokenMap[token.mint] = { ...token, symbol };
+      const symbol = token.symbol || token.name || token.mint.slice(0, 6);
       const valueLabel = formatUsd(token.valueUsdt);
+      tokenMap[token.mint] = { ...token, symbol };
       return Markup.button.callback(
         `${symbol} • ${valueLabel}`,
         `sell:token:${token.mint}`
@@ -138,7 +138,7 @@ async function handleSellStart(ctx) {
     };
 
     const infoLines = tokens.map((token) => {
-      const symbol = token.symbol || token.mint.slice(0, 6);
+      const symbol = token.symbol || token.name || token.mint.slice(0, 6);
       const amount = formatAmount(token.uiAmount);
       const value = formatUsd(token.valueUsdt);
       return `${symbol}: ${amount} (${value})`;

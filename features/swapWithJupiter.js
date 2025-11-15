@@ -229,6 +229,31 @@ async function jupSearchSymbol(symbol) {
 
   return data;
 }
+
+async function fetchTokenMetadataMap(mints) {
+  const uniqueMints = Array.from(
+    new Set((mints || []).filter((mint) => typeof mint === "string" && mint))
+  );
+  if (!uniqueMints.length) return {};
+
+  const out = {};
+
+  await Promise.allSettled(
+    uniqueMints.map(async (mint) => {
+      try {
+        const { data } = await TOKENS_AX.get("/tokens/v2/search", {
+          params: { query: mint },
+        });
+        const match = (data || []).find((entry) => entry.id === mint);
+        if (match) out[mint] = match;
+      } catch (err) {
+        console.warn("Failed to fetch token metadata", mint, err?.message || err);
+      }
+    })
+  );
+
+  return out;
+}
 // -----------------------------
 // Jupiter v6 (через IP/SNI при необходимости)
 // -----------------------------
@@ -270,6 +295,23 @@ function formatNumber(value) {
   return Number.isFinite(value)
     ? numberFormatter.format(value)
     : "unknown";
+}
+
+function pickPriceValue(info) {
+  if (!info || typeof info !== "object") return null;
+  const candidates = [
+    info.price,
+    info.priceUsd,
+    info.usd,
+    info.value,
+    info.priceInfo?.price,
+    info.data?.price,
+  ];
+  for (const candidate of candidates) {
+    const num = Number(candidate);
+    if (Number.isFinite(num) && num > 0) return num;
+  }
+  return null;
 }
 
 export async function swapOneSolToCoinLiteral(
@@ -427,25 +469,34 @@ export async function fetchWalletTokens({ vsToken = "USDT" } = {}) {
   try {
     priceByMint = await getPricesByMint(
       consolidated.map((t) => t.mint),
-      { vsToken, onlyVsToken: true }
+      { vsToken }
     );
   } catch (e) {
     console.warn("Failed to load prices:", e.message);
   }
 
+  let metaByMint = {};
+  try {
+    metaByMint = await fetchTokenMetadataMap(consolidated.map((t) => t.mint));
+  } catch (e) {
+    console.warn("Failed to load token metadata:", e.message);
+  }
+
   const enriched = consolidated.map((token) => {
     const price = priceByMint[token.mint] || null;
-    const priceUsdt = price?.price ? Number(price.price) : null;
+    const priceUsdt = pickPriceValue(price);
     const valueUsdt =
       priceUsdt != null && Number.isFinite(priceUsdt)
         ? priceUsdt * Number(token.uiAmount)
         : null;
+    const meta = metaByMint[token.mint] || {};
     return {
       ...token,
       symbol:
+        meta.symbol ||
         price?.symbol ||
         (token.mint === SOL_MINT ? "SOL" : token.mint.slice(0, 6)),
-      name: price?.name || null,
+      name: meta.name || price?.name || null,
       priceUsdt,
       valueUsdt,
     };
