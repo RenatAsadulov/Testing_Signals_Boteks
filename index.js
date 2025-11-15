@@ -4,7 +4,7 @@ import { StringSession } from "telegram/sessions/index.js";
 import { Api } from "telegram/index.js";
 import { NewMessage } from "telegram/events/index.js";
 import { swapOneSolToCoinLiteral } from "./features/swapWithJupiter.js";
-import settings from './data/settings.json' with { type: "json" };
+import settings from "./data/settings.json" with { type: "json" };
 
 // --- ENV ---
 const apiId = Number(process.env.API_ID);
@@ -152,13 +152,21 @@ async function main() {
       console.log("ticker", ticker);
       if (!ticker) return;
 
-      const signature = await swapOneSolToCoinLiteral(ticker, settings.amount, settings.token);
+      const swapResult = await swapOneSolToCoinLiteral(
+        ticker,
+        settings.amount,
+        settings.token,
+        settings.marketCapMinimum
+      );
 
-      if(signature.status !== "success") {
-        await client.sendMessage(
-          outboundChat.startsWith("@") ? outboundChat : BigInt(outboundChat),
-          { message: signature.text }
-        );
+      if (swapResult.status !== "success") {
+        console.log(`[${new Date().toISOString()}] Swap ${swapResult.status}`, {
+          ticker,
+          marketCap: swapResult.marketCap ?? null,
+          marketCapMinimum: settings.marketCapMinimum ?? 0,
+        });
+        await sendOutbound(client, swapResult.text || "Swap failed");
+        return;
       }
 
       const header = getHeaderLine(txt);
@@ -176,12 +184,14 @@ async function main() {
       // отправка результата в целевой чат
       const out =
         `• Bought: \`${ticker}\`\n` +
-        `Link: ${signature.text}`;
+        (swapResult.marketCap
+          ? `Market cap: ${
+              swapResult.marketCapFormatted || swapResult.marketCap
+            }\n`
+          : "") +
+        `Link: ${swapResult.text}`;
 
-      await client.sendMessage(
-        outboundChat.startsWith("@") ? outboundChat : BigInt(outboundChat),
-        { message: out }
-      );
+      await sendOutbound(client, out);
     } catch (e) {
       console.error("Handler error:", e.message);
     }

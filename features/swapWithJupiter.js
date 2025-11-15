@@ -207,7 +207,22 @@ function pickExactSymbolPreferVerified(results, wantSym) {
  * @param {string} coinLiteral                   - "$BONK" | "BONK"
  * @returns {Promise<string>} подпись транзакции
  */
-export async function swapOneSolToCoinLiteral(coinLiteral, amountC, literl) {
+const numberFormatter = new Intl.NumberFormat("en-US", {
+  maximumFractionDigits: 0,
+});
+
+function formatNumber(value) {
+  return Number.isFinite(value)
+    ? numberFormatter.format(value)
+    : "unknown";
+}
+
+export async function swapOneSolToCoinLiteral(
+  coinLiteral,
+  amountC,
+  literl,
+  marketCapMinimum
+) {
   if (!amountC || !literl) {
     return {
       status: "error",
@@ -229,6 +244,25 @@ export async function swapOneSolToCoinLiteral(coinLiteral, amountC, literl) {
     const list = await jupSearchSymbol(outSym);
     let chosen = pickExactSymbolPreferVerified(list, outSym);
     let outputMint = chosen.id;
+    const minMarketCap = Number(marketCapMinimum) || 0;
+    const tokenMarketCap = Number(
+      chosen.marketCap ?? chosen.market_cap ?? chosen.marketcap ?? 0
+    );
+    if (minMarketCap > 0) {
+      if (!Number.isFinite(tokenMarketCap) || tokenMarketCap < minMarketCap) {
+        return {
+          status: "skipped",
+          text: `Skipped ${outSym}: market cap ${formatNumber(
+            tokenMarketCap
+          )} < minimum ${formatNumber(minMarketCap)}`,
+          marketCap: Number.isFinite(tokenMarketCap) ? tokenMarketCap : null,
+          marketCapFormatted: Number.isFinite(tokenMarketCap)
+            ? formatNumber(tokenMarketCap)
+            : null,
+          marketCapMinimum: minMarketCap,
+        };
+      }
+    }
     const inToken = await resolveMintBySymbol(literl); // ← резолвим USDT
     const uiAmount = amountC; // ← 10 USDT
     const amount = toRawAmount(uiAmount, inToken.dec); // 10 * 10^6 -> "10000000"
@@ -253,7 +287,13 @@ export async function swapOneSolToCoinLiteral(coinLiteral, amountC, literl) {
 
     const solcanLink = `https://solscan.io/tx/${sig}`;
 
-    return { status: "success", text: solcanLink };
+    const hasMarketCap = Number.isFinite(tokenMarketCap);
+    return {
+      status: "success",
+      text: solcanLink,
+      marketCap: hasMarketCap ? tokenMarketCap : null,
+      marketCapFormatted: hasMarketCap ? formatNumber(tokenMarketCap) : null,
+    };
   } catch (error) {
     console.log("ERROR", error);
     return { status: "error", text: "Error: " + error.message };
