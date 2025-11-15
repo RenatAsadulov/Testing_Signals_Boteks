@@ -2,6 +2,7 @@ import "dotenv/config";
 import { Telegraf, Markup, session } from "telegraf";
 import { Store } from "./store.mjs";
 import { recordWalletSnapshot } from "./walletStatistics.mjs";
+import { createTradingEngine } from "./tradingEngine.mjs";
 import {
   initMongo,
   mongoConfigured,
@@ -9,6 +10,7 @@ import {
   saveSettingsDocument,
   updateTokenAggregates,
   updateWalletAggregate,
+  getTradingSummary,
 } from "./mongoClient.mjs";
 import {
   executeSwapQuote,
@@ -53,6 +55,12 @@ if (!mongoReady) {
 }
 
 const bot = new Telegraf(BOT_TOKEN);
+
+const tradingEngine = createTradingEngine({
+  store,
+  notifier: bot.telegram,
+  logger: console,
+});
 
 bot.use(session());
 
@@ -164,6 +172,7 @@ function makeKeyboard(settings) {
     [Markup.button.callback(currencyLabel, "edit:token")],
     [Markup.button.callback(profitTargetLabel, "edit:profitTargetPercent")],
     [Markup.button.callback(amountLabel, "edit:amount")],
+    [Markup.button.callback("⬅️ Back", "settings:back")],
   ];
   return Markup.inlineKeyboard(rows);
 }
@@ -173,6 +182,13 @@ function makeMainMenuKeyboard() {
     [["Sell", "Buy"], ["Statistics", "Trade-Bot"]],
     { columns: 2 }
   )
+    .resize()
+    .persistent();
+}
+
+function makeTradingMenuKeyboard(isRunning = false) {
+  const actionLabel = isRunning ? "Stop trading" : "Start trading";
+  return Markup.keyboard([["Configuration"], [actionLabel]])
     .resize()
     .persistent();
 }
@@ -1193,6 +1209,23 @@ bot.hears("Statistics", async (ctx) => {
       `Текущий баланс: ${formatUsdDetailed(totalValue)}`,
     ];
 
+    try {
+      const tradingSummary = await getTradingSummary();
+      if (tradingSummary) {
+        const profitUsd = Number(tradingSummary.totalProfitUsd || 0);
+        const profitPercent = Number(tradingSummary.totalProfitPercent || 0);
+        const profitUsdText = `${profitUsd >= 0 ? "" : "-"}$${Math.abs(
+          profitUsd
+        ).toFixed(2)}`;
+        const profitPercentText = `${profitPercent >= 0 ? "" : "-"}${Math.abs(
+          profitPercent
+        ).toFixed(2)}%`;
+        lines.push(`trading results: ${profitUsdText} / ${profitPercentText}`);
+      }
+    } catch (err) {
+      console.error("Failed to load trading summary", err);
+    }
+
     const dayLine = formatChangeLine({
       label: "Изменение за 24ч",
       currentValue: totalValue,
@@ -1238,7 +1271,61 @@ bot.hears("Statistics", async (ctx) => {
 });
 
 bot.hears("Trade-Bot", async (ctx) => {
+  await ctx.reply(
+    "🧠 Trading bot controls:",
+    makeTradingMenuKeyboard(tradingEngine.isRunning())
+  );
+});
+
+bot.hears("Configuration", async (ctx) => {
   await replyWithSettings(ctx);
+});
+
+bot.hears("Start trading", async (ctx) => {
+  try {
+    const chatId = ctx.chat?.id ?? null;
+    const result = await tradingEngine.start({ notifyChatId: chatId });
+    if (result?.alreadyRunning) {
+      await ctx.reply(
+        "Trading engine уже запущен.",
+        makeTradingMenuKeyboard(tradingEngine.isRunning())
+      );
+    } else {
+      await ctx.reply(
+        "Trading engine started ✅",
+        makeTradingMenuKeyboard(true)
+      );
+    }
+  } catch (err) {
+    console.error("Start trading error", err);
+    await ctx.reply(
+      "Не удалось запустить трейдинг: " + err.message,
+      makeTradingMenuKeyboard(tradingEngine.isRunning())
+    );
+  }
+});
+
+bot.hears("Stop trading", async (ctx) => {
+  try {
+    if (!tradingEngine.isRunning()) {
+      await ctx.reply(
+        "Trading engine уже остановлен.",
+        makeTradingMenuKeyboard(false)
+      );
+      return;
+    }
+    await tradingEngine.stop();
+    await ctx.reply(
+      "Trading engine stopped ⛔",
+      makeTradingMenuKeyboard(false)
+    );
+  } catch (err) {
+    console.error("Stop trading error", err);
+    await ctx.reply(
+      "Не удалось остановить трейдинг: " + err.message,
+      makeTradingMenuKeyboard(tradingEngine.isRunning())
+    );
+  }
 });
 
 bot.command("get", async (ctx) => {
@@ -1297,6 +1384,21 @@ bot.command("set", async (ctx) => {
 bot.on("callback_query", async (ctx) => {
   try {
     const data = ctx.callbackQuery.data || "";
+    if (data === "settings:back") {
+      await ctx.answerCbQuery();
+      try {
+        await ctx.editMessageReplyMarkup();
+      } catch (err) {
+        if (err?.response?.error_code !== 400) {
+          console.warn("Failed to clear settings keyboard:", err);
+        }
+      }
+      await ctx.reply(
+        "🧠 Trading bot controls:",
+        makeTradingMenuKeyboard(tradingEngine.isRunning())
+      );
+      return;
+    }
     if (data.startsWith("sell:")) {
       await handleSellCallback(ctx, data);
       return;

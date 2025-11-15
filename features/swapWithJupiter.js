@@ -361,7 +361,10 @@ export async function swapOneSolToCoinLiteral(
       }
     }
     const inToken = await resolveMintBySymbol(literl); // ← резолвим USDT
-    const uiAmount = amountC; // ← 10 USDT
+    const uiAmount = Number(amountC); // ← 10 USDT
+    if (!Number.isFinite(uiAmount) || uiAmount <= 0) {
+      throw new Error("Invalid swap amount");
+    }
     const amount = toRawAmount(uiAmount, inToken.dec); // 10 * 10^6 -> "10000000"
 
     const params = {
@@ -385,11 +388,44 @@ export async function swapOneSolToCoinLiteral(
     const solcanLink = `https://solscan.io/tx/${sig}`;
 
     const hasMarketCap = Number.isFinite(tokenMarketCap);
+
+    const outAmountRaw = quoteRaw?.outAmount ?? null;
+    const outDecimals =
+      typeof chosen?.decimals === "number" && Number.isFinite(chosen.decimals)
+        ? Number(chosen.decimals)
+        : null;
+    const outAmountUi =
+      outAmountRaw && outDecimals != null
+        ? Number(outAmountRaw) / 10 ** outDecimals
+        : null;
+    const baseDecimals =
+      typeof inToken?.dec === "number" && Number.isFinite(inToken.dec)
+        ? Number(inToken.dec)
+        : null;
+    const baseSymbol =
+      (inToken?.meta?.symbol || inToken?.meta?.symbolAlt || literl || "")
+        .toString()
+        .toUpperCase();
+
     return {
       status: "success",
       text: solcanLink,
       marketCap: hasMarketCap ? tokenMarketCap : null,
       marketCapFormatted: hasMarketCap ? formatNumber(tokenMarketCap) : null,
+      purchasedMint: outputMint,
+      purchasedSymbol: chosen?.symbol || outSym,
+      purchasedAmountRaw: outAmountRaw || null,
+      purchasedAmountUi:
+        outAmountUi != null && Number.isFinite(outAmountUi)
+          ? outAmountUi
+          : null,
+      purchasedDecimals: outDecimals,
+      spentAmountUi: Number.isFinite(uiAmount) ? Number(uiAmount) : null,
+      spentAmountRaw: amount,
+      baseMint: inToken?.mint || null,
+      baseDecimals,
+      baseSymbol,
+      transactionSignature: sig,
     };
   } catch (error) {
     console.log("ERROR", error);
