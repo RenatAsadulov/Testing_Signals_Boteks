@@ -639,17 +639,15 @@ export function createTradingEngine({ store, notifier, logger } = {}) {
       if (swapResult.status !== "success") {
         if (swapAttempt.exhaustedTimeoutRetries) {
           await notifyAll(
-            `Не удалось приобрести ${ticker}: таймаут транзакции после ${swapAttempt.attempts} попыток.`
+            `Failed to buy ${ticker}: transaction timeout after ${swapAttempt.attempts} attempts.`
           );
           return;
         }
         const statusText =
           swapResult.status === "skipped"
-            ? "сигнал пропущен"
-            : "ошибка свапа";
-        await notifyAll(
-          `Не удалось приобрести ${ticker}: ${statusText}.`
-        );
+            ? "signal skipped"
+            : "swap error";
+        await notifyAll(`Failed to buy ${ticker}: ${statusText}.`);
         return;
       }
       const header = getHeaderLine(txt);
@@ -710,7 +708,7 @@ export function createTradingEngine({ store, notifier, logger } = {}) {
       password: () => Promise.resolve(process.env.PASSWORD || ""),
       phoneCode: async () => {
         throw new Error(
-          "Первый вход сделай интерактивно, получи SESSION и сохрани его в .env"
+          "Complete the first login interactively, grab SESSION, and save it to .env"
         );
       },
       onError: (e) => log.error?.(e),
@@ -719,7 +717,7 @@ export function createTradingEngine({ store, notifier, logger } = {}) {
     log.log?.(
       "SESSION:\n",
       client.session.save(),
-      "\n— положи в .env как SESSION."
+      "\n— store it in .env as SESSION."
     );
 
     if (joinTarget) {

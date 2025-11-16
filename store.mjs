@@ -66,7 +66,7 @@ export class Store {
     const next = {
       ...current,
       token,
-      ...(changed ? { amount: 0 } : {}), // <- сброс в 0 (можно поставить своё значение)
+      ...(changed ? { amount: 0 } : {}), // <- reset to 0 (you can provide your own value)
     };
 
     return this.enqueue(next);

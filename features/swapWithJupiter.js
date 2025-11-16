@@ -1,4 +1,4 @@
-// ESM: "type": "module" в package.json
+// ESM: set "type": "module" in package.json
 import axios from "axios";
 import https from "node:https";
 import bs58 from "bs58";
@@ -73,7 +73,7 @@ function getPriorityFeeLamports() {
 }
 
 // -----------------------------
-// Константы / заголовки
+// Constants / headers
 // -----------------------------
 const COMMON_HEADERS = {
   accept: "application/json",
@@ -100,7 +100,7 @@ async function resolveMintBySymbol(symbol) {
 }
 
 // -----------------------------
-// HTTP клиенты (Jupiter v6 и Tokens v2)
+// HTTP clients (Jupiter v6 and Tokens v2)
 // -----------------------------
 function createJupClient({ host = "quote-api.jup.ag", ip }) {
   if (ip) {
@@ -111,7 +111,7 @@ function createJupClient({ host = "quote-api.jup.ag", ip }) {
         keepAlive: false,
         servername: host,
       }),
-      headers: { ...COMMON_HEADERS, host }, // Host header обязателен при работе по IP
+      headers: { ...COMMON_HEADERS, host }, // Host header is required when working over IP
       timeout: 15000,
     });
   }
@@ -123,7 +123,7 @@ function createJupClient({ host = "quote-api.jup.ag", ip }) {
   });
 }
 
-// Tokens v2 (обычно резолвится нормально; при желании можно сделать IP-аналог)
+// Tokens v2 (usually resolves fine; add an IP-based variant if needed)
 const TOKENS_AX = axios.create({
   baseURL: "https://lite-api.jup.ag",
   httpsAgent: new https.Agent({ family: 4, keepAlive: false }),
@@ -132,7 +132,7 @@ const TOKENS_AX = axios.create({
 });
 
 // -----------------------------
-// Утилиты
+// Utilities
 // -----------------------------
 function normalizeLiteral(lit) {
   return String(lit || "")
@@ -147,9 +147,9 @@ async function buildSignSendSwap({
   wallet,
   priorityMaxLamports = 200_000,
 }) {
-  // 1) Сборка транзакции на стороне Jupiter
+  // 1) Build the transaction on the Jupiter side
   const { data } = await jax.post("/v6/swap", {
-    quoteResponse: q, // ← передаём ВЕСЬ объект котировки
+    quoteResponse: q, // ← pass the entire quote object
     userPublicKey: wallet.publicKey.toBase58(),
     asLegacyTransaction: false,
     prioritizationFeeLamports: {
@@ -164,7 +164,7 @@ async function buildSignSendSwap({
   if (!swapTransaction)
     throw new Error("No swapTransaction in Jupiter response");
 
-  // 2) Подписать и отправить с твоего кошелька
+  // 2) Sign and send from your wallet
   const tx = VersionedTransaction.deserialize(
     Buffer.from(swapTransaction, "base64")
   );
@@ -190,7 +190,7 @@ function toRawAmount(ui, decimals) {
 function keypairFromAny(secret) {
   const s = typeof secret === "string" ? secret.trim() : JSON.stringify(secret);
 
-  // JSON-массив байт
+  // JSON array of bytes
   if (s.startsWith("[")) {
     const arr = JSON.parse(s);
     const bytes = Uint8Array.from(arr);
@@ -260,7 +260,7 @@ async function fetchTokenMetadataMap(mints) {
   return out;
 }
 // -----------------------------
-// Jupiter v6 (через IP/SNI при необходимости)
+// Jupiter v6 (via IP/SNI when necessary)
 // -----------------------------
 
 function pickExactSymbolPreferVerified(results, wantSym) {
@@ -269,28 +269,28 @@ function pickExactSymbolPreferVerified(results, wantSym) {
     (t) => (t.symbol || "").toUpperCase() === want
   );
   if (!exact.length) throw new Error(`No exact symbol match for "${wantSym}".`);
-  // только verified сначала
+  // pick verified tokens first
   const verified = exact.filter((t) => !!t.verified);
   if (verified.length) return verified[0];
-  // иначе берём с наибольшей ликвидностью/объёмом если есть такое поле, иначе первый
+  // otherwise use the highest-liquidity/volume entry if available, else the first one
   exact.sort((a, b) => (b.liquidity ?? 0) - (a.liquidity ?? 0));
   return exact[0];
 }
 
 // -----------------------------
-// Основная функция
+// Main function
 // -----------------------------
 /**
- * Свап 1 SOL -> токен по литералу (например "$BONK"), Jupiter v6
+ * Swap 1 SOL -> token by literal (for example "$BONK"), Jupiter v6
  * @param {Object} env
  * @param {string} env.RPC_URL                    - Solana mainnet RPC
- * @param {string|number[]} env.walletSecretKey - base58 или JSON-массив байт
+ * @param {string|number[]} env.walletSecretKey - base58 or a JSON byte array
  * @param {number} [env.slippageBps=50]
  * @param {number} [env.priorityMaxLamports=200_000]
  * @param {string} [env.jupHost="quote-api.jup.ag"]
- * @param {string} [env.jupIp]                   - если указан, используем IP + SNI (обход DNS)
+ * @param {string} [env.jupIp]                   - if set, use IP + SNI (DNS bypass)
  * @param {string} coinLiteral                   - "$BONK" | "BONK"
- * @returns {Promise<string>} подпись транзакции
+ * @returns {Promise<string>} transaction signature
  */
 const numberFormatter = new Intl.NumberFormat("en-US", {
   maximumFractionDigits: 0,
@@ -333,10 +333,10 @@ export async function swapOneSolToCoinLiteral(
     const conn = ensureConnection();
     const wallet = ensureWallet();
 
-    // HTTP клиент для Jupiter v6
+    // HTTP client for Jupiter v6
     const JAX = ensureJax();
 
-    // 1) mint по символу
+    // 1) mint by symbol
     const outSym = normalizeLiteral(coinLiteral); // "$BONK" -> "BONK"
     const list = await jupSearchSymbol(outSym);
     let chosen = pickExactSymbolPreferVerified(list, outSym);
@@ -360,7 +360,7 @@ export async function swapOneSolToCoinLiteral(
         };
       }
     }
-    const inToken = await resolveMintBySymbol(literl); // ← резолвим USDT
+    const inToken = await resolveMintBySymbol(literl); // ← resolve USDT
     const uiAmount = Number(amountC); // ← 10 USDT
     if (!Number.isFinite(uiAmount) || uiAmount <= 0) {
       throw new Error("Invalid swap amount");
@@ -596,7 +596,7 @@ export async function getSwapQuote({
 
     if (code === "COULD_NOT_FIND_ANY_ROUTE") {
       throw new Error(
-        "Jupiter не нашёл маршрут для этого обмена. Попробуйте уменьшить сумму или выбрать другую пару."
+        "Jupiter couldn't find a route for this swap. Try lowering the amount or choosing another pair."
       );
     }
 
@@ -625,7 +625,7 @@ export async function executeSwapQuote(quoteResponse, opt = {}) {
 export { toRawAmount };
 
 // ====== Jupiter Price API (Lite implementation based on dev docs) ==========
-// Требуются axios и https уже импортированные в файле.
+// Requires axios and https to already be imported in the file.
 
 const __PRICE_HEADERS =
   typeof COMMON_HEADERS !== "undefined"
@@ -637,7 +637,7 @@ const __PRICE_HEADERS =
         referer: "https://jup.ag/",
       };
 
-const PRICE_BASE_URL = "https://lite-api.jup.ag"; // TODO: вынести в .env, когда появится необходимость менять маршрут
+const PRICE_BASE_URL = "https://lite-api.jup.ag"; // TODO: move to .env when we need to change the route
 const PRICE_TIMEOUT_MS = 15000;
 const PRICE_BATCH_SIZE = 100;
 const PRICE_DEFAULT_VS_TOKEN = "USDC";
@@ -705,7 +705,7 @@ async function __requestPrice(path, params, { label, signal } = {}) {
   throw lastErr;
 }
 
-// ---- Tokens v2 search (используем существующий TOKENS_AX, если он есть)
+// ---- Tokens v2 search (reuse the existing TOKENS_AX if available)
 const __TOK_AX =
   typeof TOKENS_AX !== "undefined"
     ? TOKENS_AX
@@ -795,7 +795,7 @@ function __normalizeVsCandidates(primary, extras, includeNull = true) {
 
 // ---------------- PUBLIC API ----------------
 
-/** Цена(ы) по mint(ам). По умолчанию в USDC. */
+/** Price(s) by mint(s). Defaults to USDC. */
 export async function getPricesByMint(mintOrMints, opt = {}) {
   const ids = (Array.isArray(mintOrMints) ? mintOrMints : [mintOrMints])
     .map((id) => String(id || "").trim())
@@ -866,14 +866,14 @@ export async function getPricesByMint(mintOrMints, opt = {}) {
   return prices;
 }
 
-/** Цена по символу (например 'SOL'/'BONK'). */
+/** Price by symbol (for example 'SOL'/'BONK'). */
 export async function getPriceBySymbol(symbol, opt = {}) {
   const { mint } = await __resolveMintBySymbol(symbol);
   const res = await getPricesByMint(mint, opt);
   return res[mint] || null;
 }
 
-/** Батч-цены по символам — вернёт массив в исходном порядке. */
+/** Batch prices by symbols — returns an array in the original order. */
 export async function getPricesBySymbols(symbols, opt = {}) {
   const mints = await Promise.all(symbols.map(__resolveMintBySymbol));
   const byMint = await getPricesByMint(
@@ -887,7 +887,7 @@ export async function getPricesBySymbols(symbols, opt = {}) {
   }));
 }
 
-/** Изменение цены за период: "24h" | "7d" | "30d". */
+/** Price change for the period: "24h" | "7d" | "30d". */
 export async function getPriceChanges(mints, interval = "24h") {
   const ids = (Array.isArray(mints) ? mints : [mints])
     .map((id) => String(id || "").trim())
@@ -905,7 +905,7 @@ export async function getPriceChanges(mints, interval = "24h") {
   return data?.data || {};
 }
 // ============================================================================
-// Примеры вызова:
+// Usage examples:
 // const p1 = await getPriceBySymbol("BONK", { vsToken: "USDC", onlyVsToken: true });
 // const p2 = await getPricesBySymbols(["SOL","USDT","BONK"], { vsToken: "USDC" });
 // const ch = await getPriceChanges(["So11111111111111111111111111111111111111112"], "24h");
