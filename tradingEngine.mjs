@@ -23,6 +23,59 @@ const outboundChat = process.env.TELEGRAM_CHAT_ID || "";
 const monitorIntervalMs =
   Number(process.env.TRADING_MONITOR_INTERVAL_MS) || 60_000;
 
+const DEFAULT_PHANTOM_SWAP_FEE_PERCENT = 0.85;
+
+function resolvePhantomSwapFeePercent(settings) {
+  const configured = Number(settings?.phantomSwapFeePercent);
+  if (Number.isFinite(configured) && configured >= 0) {
+    return configured;
+  }
+  const fromEnv = Number(process.env.PHANTOM_SWAP_FEE_PERCENT);
+  if (Number.isFinite(fromEnv) && fromEnv >= 0) {
+    return fromEnv;
+  }
+  return DEFAULT_PHANTOM_SWAP_FEE_PERCENT;
+}
+
+function getTokenPriceUsd(token) {
+  if (!token) return null;
+  const price = Number(token.priceUsdt);
+  if (Number.isFinite(price) && price > 0) {
+    return price;
+  }
+  const value = Number(token.valueUsdt);
+  const amount = Number(token.uiAmount);
+  if (
+    Number.isFinite(value) &&
+    Number.isFinite(amount) &&
+    amount > 0 &&
+    value > 0
+  ) {
+    return value / amount;
+  }
+  return null;
+}
+
+function getWalletAmount(token, position) {
+  const walletAmount = Number(token?.uiAmount);
+  if (Number.isFinite(walletAmount) && walletAmount > 0) {
+    return walletAmount;
+  }
+  const recorded = Number(position?.amountUi);
+  if (Number.isFinite(recorded) && recorded > 0) {
+    return recorded;
+  }
+  return null;
+}
+
+function getAverageEntryPrice(position) {
+  const cost = Number(position?.costBaseAmount ?? position?.costUsd ?? 0);
+  const amount = Number(position?.amountUi);
+  if (!Number.isFinite(cost) || cost <= 0) return null;
+  if (!Number.isFinite(amount) || amount <= 0) return null;
+  return cost / amount;
+}
+
 function sanitize(text = "") {
   return text
     .replace(/https?:\/\/\S+/g, "")
@@ -405,19 +458,42 @@ export function createTradingEngine({ store, notifier, logger } = {}) {
       try {
         const settings = await safeStore.getAll();
         const profitTarget = Number(settings?.profitTargetPercent || 0);
-        if (!profitTarget || profitTarget <= 0) return;
+        const phantomFeePercent = resolvePhantomSwapFeePercent(settings);
+        const effectiveTargetPercent =
+          profitTarget > 0 ? profitTarget + phantomFeePercent : 0;
+        if (!effectiveTargetPercent || effectiveTargetPercent <= 0) return;
         const tokens = await fetchWalletTokens({ vsToken: settings.token });
+        if (!tokens.length) return;
+        const tokenMap = new Map(tokens.map((t) => [t.mint, t]));
         for (const position of positions.values()) {
-          const token = tokens.find((t) => t.mint === position.mint);
+          const token = tokenMap.get(position.mint);
           if (!token) continue;
-          const baseToken = tokens.find((t) => t.mint === position.baseMint);
-          const currentValue = Number(token.valueUsdt);
-          const cost = Number(position.costUsd);
-          if (!Number.isFinite(cost) || cost <= 0) continue;
-          if (!Number.isFinite(currentValue)) continue;
-          const profit = currentValue - cost;
-          const profitPercent = (profit / cost) * 100;
-          if (profitPercent >= profitTarget) {
+          const baseToken = tokenMap.get(position.baseMint);
+          const walletAmount = getWalletAmount(token, position);
+          const avgEntryPrice = getAverageEntryPrice(position);
+          const currentPrice = getTokenPriceUsd(token);
+          if (
+            walletAmount == null ||
+            avgEntryPrice == null ||
+            currentPrice == null ||
+            walletAmount <= 0 ||
+            avgEntryPrice <= 0
+          ) {
+            continue;
+          }
+          const entryValue = walletAmount * avgEntryPrice;
+          if (!Number.isFinite(entryValue) || entryValue <= 0) {
+            continue;
+          }
+          const currentValue = walletAmount * currentPrice;
+          const profitPercent =
+            entryValue > 0
+              ? ((currentValue - entryValue) / entryValue) * 100
+              : null;
+          if (
+            profitPercent != null &&
+            profitPercent >= effectiveTargetPercent
+          ) {
             await handleSellPosition({
               position,
               walletToken: token,
@@ -562,6 +638,7 @@ export function createTradingEngine({ store, notifier, logger } = {}) {
     running = true;
     log.log?.("Trading engine started. Listening for new messages…");
     await notifyAll("Trading engine started");
+    await monitorPositions();
     return { started: true };
   }
 
