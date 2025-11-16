@@ -188,7 +188,7 @@ function makeMainMenuKeyboard() {
 
 function makeTradingMenuKeyboard(isRunning = false) {
   const actionLabel = isRunning ? "Stop trading" : "Start trading";
-  return Markup.keyboard([["Configuration"], [actionLabel]])
+  return Markup.keyboard([["Configuration"], [actionLabel], ["Back"]])
     .resize()
     .persistent();
 }
@@ -1280,6 +1280,13 @@ bot.hears("Trade-Bot", async (ctx) => {
   await ctx.reply(
     "🧠 Trading bot controls:",
     makeTradingMenuKeyboard(tradingEngine.isRunning())
+  );
+});
+
+bot.hears("Back", async (ctx) => {
+  await ctx.reply(
+    "Select an action:",
+    makeMainMenuKeyboard()
   );
 });
 
