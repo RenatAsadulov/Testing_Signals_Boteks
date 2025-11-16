@@ -33,14 +33,23 @@ const TIMEOUT_ERROR_CODES = new Set([
   "REQUEST_TIMEOUT",
 ]);
 
+const TIMEOUT_TEXT_PATTERNS = [
+  "timeout",
+  "timed out",
+  "took too long",
+  "time-out",
+  "not confirmed in",
+  "not confirmed within",
+  "not confirmed",
+  "unknown if it succeeded",
+  "check signature",
+];
+
 function looksLikeTimeoutText(value) {
   if (!value) return false;
   const normalized = String(value).toLowerCase();
-  return (
-    normalized.includes("timeout") ||
-    normalized.includes("timed out") ||
-    normalized.includes("took too long") ||
-    normalized.includes("time-out")
+  return TIMEOUT_TEXT_PATTERNS.some((pattern) =>
+    normalized.includes(pattern)
   );
 }
 
@@ -58,6 +67,9 @@ function swapResultIndicatesTimeout(result) {
     return true;
   }
   if (looksLikeTimeoutText(result.text)) {
+    return true;
+  }
+  if (looksLikeTimeoutText(result.message)) {
     return true;
   }
   return false;
@@ -631,9 +643,13 @@ export function createTradingEngine({ store, notifier, logger } = {}) {
           );
           return;
         }
-        const message =
-          swapResult.text || `Swap ${swapResult.status} for ${ticker}`;
-        await notifyAll(message);
+        const statusText =
+          swapResult.status === "skipped"
+            ? "сигнал пропущен"
+            : "ошибка свапа";
+        await notifyAll(
+          `Не удалось приобрести ${ticker}: ${statusText}.`
+        );
         return;
       }
       const header = getHeaderLine(txt);
