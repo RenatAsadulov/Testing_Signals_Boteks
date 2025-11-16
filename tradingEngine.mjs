@@ -23,6 +23,109 @@ const outboundChat = process.env.TELEGRAM_CHAT_ID || "";
 const monitorIntervalMs =
   Number(process.env.TRADING_MONITOR_INTERVAL_MS) || 60_000;
 
+const DEFAULT_PHANTOM_SWAP_FEE_PERCENT = 0.85;
+const MAX_SWAP_TIMEOUT_RETRIES = 3;
+const TIMEOUT_ERROR_CODES = new Set([
+  "ETIMEDOUT",
+  "ESOCKETTIMEDOUT",
+  "ETIME",
+  "ECONNABORTED",
+  "REQUEST_TIMEOUT",
+]);
+
+const TIMEOUT_TEXT_PATTERNS = [
+  "timeout",
+  "timed out",
+  "took too long",
+  "time-out",
+  "not confirmed in",
+  "not confirmed within",
+  "not confirmed",
+  "unknown if it succeeded",
+  "check signature",
+];
+
+function looksLikeTimeoutText(value) {
+  if (!value) return false;
+  const normalized = String(value).toLowerCase();
+  return TIMEOUT_TEXT_PATTERNS.some((pattern) =>
+    normalized.includes(pattern)
+  );
+}
+
+function swapResultIndicatesTimeout(result) {
+  if (!result || typeof result !== "object") return false;
+  const code = String(result.errorCode || result.code || "").toUpperCase();
+  if (code && TIMEOUT_ERROR_CODES.has(code)) {
+    return true;
+  }
+  const httpStatus = Number(result.httpStatus);
+  if (httpStatus === 408 || httpStatus === 504) {
+    return true;
+  }
+  if (looksLikeTimeoutText(result.errorMessage)) {
+    return true;
+  }
+  if (looksLikeTimeoutText(result.text)) {
+    return true;
+  }
+  if (looksLikeTimeoutText(result.message)) {
+    return true;
+  }
+  return false;
+}
+
+function resolvePhantomSwapFeePercent(settings) {
+  const configured = Number(settings?.phantomSwapFeePercent);
+  if (Number.isFinite(configured) && configured >= 0) {
+    return configured;
+  }
+  const fromEnv = Number(process.env.PHANTOM_SWAP_FEE_PERCENT);
+  if (Number.isFinite(fromEnv) && fromEnv >= 0) {
+    return fromEnv;
+  }
+  return DEFAULT_PHANTOM_SWAP_FEE_PERCENT;
+}
+
+function getTokenPriceUsd(token) {
+  if (!token) return null;
+  const price = Number(token.priceUsdt);
+  if (Number.isFinite(price) && price > 0) {
+    return price;
+  }
+  const value = Number(token.valueUsdt);
+  const amount = Number(token.uiAmount);
+  if (
+    Number.isFinite(value) &&
+    Number.isFinite(amount) &&
+    amount > 0 &&
+    value > 0
+  ) {
+    return value / amount;
+  }
+  return null;
+}
+
+function getWalletAmount(token, position) {
+  const walletAmount = Number(token?.uiAmount);
+  if (Number.isFinite(walletAmount) && walletAmount > 0) {
+    return walletAmount;
+  }
+  const recorded = Number(position?.amountUi);
+  if (Number.isFinite(recorded) && recorded > 0) {
+    return recorded;
+  }
+  return null;
+}
+
+function getAverageEntryPrice(position) {
+  const cost = Number(position?.costBaseAmount ?? position?.costUsd ?? 0);
+  const amount = Number(position?.amountUi);
+  if (!Number.isFinite(cost) || cost <= 0) return null;
+  if (!Number.isFinite(amount) || amount <= 0) return null;
+  return cost / amount;
+}
+
 function sanitize(text = "") {
   return text
     .replace(/https?:\/\/\S+/g, "")
@@ -250,6 +353,49 @@ export function createTradingEngine({ store, notifier, logger } = {}) {
     }
   }
 
+  async function executeSwapWithTimeoutRetries({
+    ticker,
+    amount,
+    token,
+    marketCapMinimum,
+  }) {
+    let result = null;
+    for (let attempt = 1; attempt <= MAX_SWAP_TIMEOUT_RETRIES; attempt += 1) {
+      result = await swapOneSolToCoinLiteral(
+        ticker,
+        amount,
+        token,
+        marketCapMinimum
+      );
+      if (!result) {
+        result = {
+          status: "error",
+          text: `Swap failed for ${ticker}`,
+        };
+      }
+      if (result.status === "success" || result.status === "skipped") {
+        return { result, attempts: attempt, exhaustedTimeoutRetries: false };
+      }
+      const timedOut = swapResultIndicatesTimeout(result);
+      if (!timedOut) {
+        return { result, attempts: attempt, exhaustedTimeoutRetries: false };
+      }
+      if (attempt === MAX_SWAP_TIMEOUT_RETRIES) {
+        return { result, attempts: attempt, exhaustedTimeoutRetries: true };
+      }
+      log.warn?.(
+        `Swap attempt ${attempt} for ${ticker} timed out. Retrying attempt ${
+          attempt + 1
+        }...`
+      );
+    }
+    return {
+      result: result || { status: "error", text: `Swap failed for ${ticker}` },
+      attempts: MAX_SWAP_TIMEOUT_RETRIES,
+      exhaustedTimeoutRetries: false,
+    };
+  }
+
   async function handleBuySuccess({
     ticker,
     swapResult,
@@ -405,19 +551,42 @@ export function createTradingEngine({ store, notifier, logger } = {}) {
       try {
         const settings = await safeStore.getAll();
         const profitTarget = Number(settings?.profitTargetPercent || 0);
-        if (!profitTarget || profitTarget <= 0) return;
+        const phantomFeePercent = resolvePhantomSwapFeePercent(settings);
+        const effectiveTargetPercent =
+          profitTarget > 0 ? profitTarget + phantomFeePercent : 0;
+        if (!effectiveTargetPercent || effectiveTargetPercent <= 0) return;
         const tokens = await fetchWalletTokens({ vsToken: settings.token });
+        if (!tokens.length) return;
+        const tokenMap = new Map(tokens.map((t) => [t.mint, t]));
         for (const position of positions.values()) {
-          const token = tokens.find((t) => t.mint === position.mint);
+          const token = tokenMap.get(position.mint);
           if (!token) continue;
-          const baseToken = tokens.find((t) => t.mint === position.baseMint);
-          const currentValue = Number(token.valueUsdt);
-          const cost = Number(position.costUsd);
-          if (!Number.isFinite(cost) || cost <= 0) continue;
-          if (!Number.isFinite(currentValue)) continue;
-          const profit = currentValue - cost;
-          const profitPercent = (profit / cost) * 100;
-          if (profitPercent >= profitTarget) {
+          const baseToken = tokenMap.get(position.baseMint);
+          const walletAmount = getWalletAmount(token, position);
+          const avgEntryPrice = getAverageEntryPrice(position);
+          const currentPrice = getTokenPriceUsd(token);
+          if (
+            walletAmount == null ||
+            avgEntryPrice == null ||
+            currentPrice == null ||
+            walletAmount <= 0 ||
+            avgEntryPrice <= 0
+          ) {
+            continue;
+          }
+          const entryValue = walletAmount * avgEntryPrice;
+          if (!Number.isFinite(entryValue) || entryValue <= 0) {
+            continue;
+          }
+          const currentValue = walletAmount * currentPrice;
+          const profitPercent =
+            entryValue > 0
+              ? ((currentValue - entryValue) / entryValue) * 100
+              : null;
+          if (
+            profitPercent != null &&
+            profitPercent >= effectiveTargetPercent
+          ) {
             await handleSellPosition({
               position,
               walletToken: token,
@@ -457,16 +626,28 @@ export function createTradingEngine({ store, notifier, logger } = {}) {
         );
         return;
       }
-      const swapResult = await swapOneSolToCoinLiteral(
+      const swapAttempt = await executeSwapWithTimeoutRetries({
         ticker,
         amount,
         token,
-        settings?.marketCapMinimum
-      );
+        marketCapMinimum: settings?.marketCapMinimum,
+      });
+      const swapResult = swapAttempt.result || {
+        status: "error",
+        text: `Swap failed for ${ticker}`,
+      };
       if (swapResult.status !== "success") {
-        const message =
-          swapResult.text || `Swap ${swapResult.status} for ${ticker}`;
-        await notifyAll(message);
+        if (swapAttempt.exhaustedTimeoutRetries) {
+          await notifyAll(
+            `Failed to buy ${ticker}: transaction timeout after ${swapAttempt.attempts} attempts.`
+          );
+          return;
+        }
+        const statusText =
+          swapResult.status === "skipped"
+            ? "signal skipped"
+            : "swap error";
+        await notifyAll(`Failed to buy ${ticker}: ${statusText}.`);
         return;
       }
       const header = getHeaderLine(txt);
@@ -527,7 +708,7 @@ export function createTradingEngine({ store, notifier, logger } = {}) {
       password: () => Promise.resolve(process.env.PASSWORD || ""),
       phoneCode: async () => {
         throw new Error(
-          "Первый вход сделай интерактивно, получи SESSION и сохрани его в .env"
+          "Complete the first login interactively, grab SESSION, and save it to .env"
         );
       },
       onError: (e) => log.error?.(e),
@@ -536,7 +717,7 @@ export function createTradingEngine({ store, notifier, logger } = {}) {
     log.log?.(
       "SESSION:\n",
       client.session.save(),
-      "\n— положи в .env как SESSION."
+      "\n— store it in .env as SESSION."
     );
 
     if (joinTarget) {
@@ -562,6 +743,7 @@ export function createTradingEngine({ store, notifier, logger } = {}) {
     running = true;
     log.log?.("Trading engine started. Listening for new messages…");
     await notifyAll("Trading engine started");
+    await monitorPositions();
     return { started: true };
   }
 

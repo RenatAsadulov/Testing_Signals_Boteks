@@ -188,7 +188,7 @@ function makeMainMenuKeyboard() {
 
 function makeTradingMenuKeyboard(isRunning = false) {
   const actionLabel = isRunning ? "Stop trading" : "Start trading";
-  return Markup.keyboard([["Configuration"], [actionLabel]])
+  return Markup.keyboard([["Configuration"], [actionLabel], ["Back"]])
     .resize()
     .persistent();
 }
@@ -241,7 +241,7 @@ function formatPercent(value) {
 }
 
 function formatUsdDetailed(value) {
-  if (!Number.isFinite(value)) return "неизвестно";
+  if (!Number.isFinite(value)) return "unknown";
   if (Math.abs(value) >= 1) return formatUsd(value);
   return `≈$${Number(value).toPrecision(4)}`;
 }
@@ -254,7 +254,7 @@ function formatDateKey(date) {
 function formatDateHuman(dateKey) {
   const date = new Date(`${dateKey}T00:00:00Z`);
   if (Number.isNaN(date.getTime())) return dateKey;
-  return new Intl.DateTimeFormat("ru-RU", {
+  return new Intl.DateTimeFormat("en-US", {
     year: "numeric",
     month: "long",
     day: "numeric",
@@ -279,7 +279,7 @@ function formatChangeLine({ label, currentValue, referenceEntry }) {
     const sign = diff >= 0 ? "+" : "-";
     parts.push(`(${sign}${Math.abs(percent).toFixed(2)}%)`);
   }
-  parts.push(`(с ${formatDateHuman(referenceEntry.date)})`);
+  parts.push(`(since ${formatDateHuman(referenceEntry.date)})`);
   return parts.join(" ");
 }
 
@@ -304,9 +304,7 @@ function pickMetaNumber(meta, keys) {
 function formatTokenMetaInfo({ symbol, meta }) {
   const lines = [];
   const name = meta?.name || meta?.tokenName || null;
-  lines.push(
-    name ? `Токен: ${symbol} (${name})` : `Токен: ${symbol}`
-  );
+  lines.push(name ? `Token: ${symbol} (${name})` : `Token: ${symbol}`);
 
   const price =
     pickMetaNumber(meta, [
@@ -317,7 +315,7 @@ function formatTokenMetaInfo({ symbol, meta }) {
       "data.price",
     ]) ?? null;
   if (Number.isFinite(price)) {
-    lines.push(`Цена: ${formatUsdDetailed(price)}`);
+    lines.push(`Price: ${formatUsdDetailed(price)}`);
   }
 
   const liquidity =
@@ -328,7 +326,7 @@ function formatTokenMetaInfo({ symbol, meta }) {
       "marketInfo.liquidity",
     ]) ?? null;
   if (Number.isFinite(liquidity)) {
-    lines.push(`Ликвидность: ${formatUsdDetailed(liquidity)}`);
+    lines.push(`Liquidity: ${formatUsdDetailed(liquidity)}`);
   }
 
   const marketCap =
@@ -339,7 +337,7 @@ function formatTokenMetaInfo({ symbol, meta }) {
       "fullyDilutedValue",
     ]) ?? null;
   if (Number.isFinite(marketCap)) {
-    lines.push(`Рыночная кап.: ${formatUsdDetailed(marketCap)}`);
+    lines.push(`Market cap: ${formatUsdDetailed(marketCap)}`);
   }
 
   const volume24h =
@@ -349,7 +347,7 @@ function formatTokenMetaInfo({ symbol, meta }) {
       "marketInfo.volume24h",
     ]) ?? null;
   if (Number.isFinite(volume24h)) {
-    lines.push(`Объём 24ч: ${formatUsdDetailed(volume24h)}`);
+    lines.push(`24h volume: ${formatUsdDetailed(volume24h)}`);
   }
 
   const change24h =
@@ -366,7 +364,7 @@ function formatTokenMetaInfo({ symbol, meta }) {
     }
     const suffix = "%";
     const formatted = value.toFixed(2);
-    lines.push(`Изм. 24ч: ${formatted}${suffix}`);
+    lines.push(`24h change: ${formatted}${suffix}`);
   }
 
   return lines;
@@ -427,7 +425,7 @@ async function handleSellStart(ctx) {
     );
     if (!tokens.length) {
       await ctx.reply(
-        "В кошельке нет токенов с доступной ценой для продажи."
+        "There are no wallet tokens with available sell prices."
       );
       return;
     }
@@ -456,15 +454,15 @@ async function handleSellStart(ctx) {
       return `${symbol}: ${amount} (${value})`;
     });
 
-    await ctx.reply(`Баланс кошелька:\n${infoLines.join("\n")}`);
+    await ctx.reply(`Wallet balance:\n${infoLines.join("\n")}`);
 
     await ctx.reply(
-      "Выберите токен для продажи:",
+      "Choose a token to sell:",
       Markup.inlineKeyboard(chunk(rows, 1))
     );
   } catch (e) {
     console.error("Sell start error:", e);
-    await ctx.reply("Не удалось получить список токенов: " + e.message);
+    await ctx.reply("Failed to fetch the token list: " + e.message);
   }
 }
 
@@ -476,11 +474,11 @@ async function handleBuyStart(ctx) {
       stage: "awaiting_symbol",
     };
     await ctx.reply(
-      "Введите символ токена, который хотите купить (например, $PEPE)."
+      "Enter the token symbol you want to buy (for example, $PEPE)."
     );
   } catch (e) {
     console.error("Buy start error:", e);
-    await ctx.reply("Не удалось начать процесс покупки: " + e.message);
+    await ctx.reply("Failed to start the buy process: " + e.message);
   }
 }
 
@@ -509,44 +507,44 @@ function makeBuyPaymentKeyboard(flow) {
       `buy:pay:${token.mint}`
     )
   );
-  rows.push(Markup.button.callback("Отмена", "buy:cancel"));
+  rows.push(Markup.button.callback("Cancel", "buy:cancel"));
   return Markup.inlineKeyboard(chunk(rows, 1));
 }
 
 function formatBuyQuotePreview(flow) {
   const { quote, paymentToken, targetToken, amountUi } = flow;
   const lines = [
-    "Предпросмотр сделки",
-    `Отправляете: ${formatAmount(amountUi)} ${paymentToken.symbol}`,
+    "Trade preview",
+    `You send: ${formatAmount(amountUi)} ${paymentToken.symbol}`,
   ];
   const outAmount = quote?.outAmount
     ? Number(quote.outAmount) / 10 ** targetToken.decimals
     : null;
   if (Number.isFinite(outAmount)) {
-    lines.push(`Получите ≈ ${formatAmount(outAmount)} ${targetToken.symbol}`);
+    lines.push(`You receive ≈ ${formatAmount(outAmount)} ${targetToken.symbol}`);
   }
   const minOut = quote?.otherAmountThreshold
     ? Number(quote.otherAmountThreshold) / 10 ** targetToken.decimals
     : null;
   if (Number.isFinite(minOut)) {
     lines.push(
-      `Мин. получение: ${formatAmount(minOut)} ${targetToken.symbol}`
+      `Minimum receive: ${formatAmount(minOut)} ${targetToken.symbol}`
     );
   }
   const priceImpact = quote?.priceImpactPct
     ? Number(quote.priceImpactPct) * 100
     : null;
   if (Number.isFinite(priceImpact)) {
-    lines.push(`Просадка: ${priceImpact.toFixed(2)}%`);
+    lines.push(`Price impact: ${priceImpact.toFixed(2)}%`);
   }
   const totalFeesLamports = Number(
     quote?.fees?.totalFeeAndDeposits ?? quote?.fees?.signatureFee ?? 0
   );
   if (Number.isFinite(totalFeesLamports) && totalFeesLamports > 0) {
     const feeSol = totalFeesLamports / 10 ** SOL_TARGET_INFO.decimals;
-    lines.push(`Сетевые комиссии: ${feeSol.toFixed(6)} SOL`);
+    lines.push(`Network fees: ${feeSol.toFixed(6)} SOL`);
   }
-  lines.push("Подтвердите, чтобы выполнить обмен.");
+  lines.push("Confirm to execute the swap.");
   return lines;
 }
 
@@ -555,7 +553,9 @@ async function handleSellCallback(ctx, data) {
   ctx.session ??= {};
   const flow = ctx.session.sellFlow;
   if (!flow) {
-    await ctx.reply("Сессия продажи не активна. Нажмите Sell, чтобы начать заново.");
+    await ctx.reply(
+      "The sell session is not active. Press Sell to start again."
+    );
     return;
   }
 
@@ -566,61 +566,63 @@ async function handleSellCallback(ctx, data) {
   if (action === "token") {
     const token = flow.tokens?.[payload];
     if (!token) {
-      await ctx.reply("Не удалось определить токен. Попробуйте снова начать процесс.");
+      await ctx.reply(
+        "Failed to resolve the token. Try restarting the flow."
+      );
       return;
     }
     if (!Number.isFinite(token.priceUsdt)) {
       await ctx.reply(
-        "Для этого токена нет данных о цене. Повторите попытку позже или выберите другой токен."
+        "No price data is available for this token. Try again later or pick a different token."
       );
       return;
     }
     flow.selectedToken = token;
     flow.stage = "chooseTarget";
-    const buttons = [
-      Markup.button.callback("Получить SOL", "sell:target:SOL"),
-      Markup.button.callback("Получить USDT", "sell:target:USDT"),
-      Markup.button.callback("Отмена", "sell:cancel"),
-    ];
-    await ctx.reply(
-      `Токен: ${token.symbol}. Выберите, что получить в обмен:`,
-      Markup.inlineKeyboard(chunk(buttons, 1))
-    );
-    return;
-  }
-
-  if (action === "target") {
-    if (!flow.selectedToken) {
-      await ctx.reply("Сначала выберите токен для продажи.");
+      const buttons = [
+        Markup.button.callback("Receive SOL", "sell:target:SOL"),
+        Markup.button.callback("Receive USDT", "sell:target:USDT"),
+        Markup.button.callback("Cancel", "sell:cancel"),
+      ];
+      await ctx.reply(
+        `Token: ${token.symbol}. Choose what to receive in exchange:`,
+        Markup.inlineKeyboard(chunk(buttons, 1))
+      );
       return;
     }
+
+    if (action === "target") {
+      if (!flow.selectedToken) {
+        await ctx.reply("Select a token to sell first.");
+        return;
+      }
     const targetSymbol = payload.toUpperCase();
     try {
       flow.target = await getSellTarget(targetSymbol);
-    } catch (e) {
-      await ctx.reply("Не удалось подготовить целевой токен: " + e.message);
-      return;
-    }
+      } catch (e) {
+        await ctx.reply("Failed to prepare the target token: " + e.message);
+        return;
+      }
     flow.stage = "awaiting_amount";
     const availableAmount = formatAmount(flow.selectedToken.uiAmount);
     const availableValue = formatUsd(flow.selectedToken.valueUsdt);
-    await ctx.reply(
-      `Введите количество ${flow.selectedToken.symbol} для обмена (доступно ${availableAmount}, ${availableValue}). Вы можете ввести число или MAX.`
-    );
-    return;
-  }
-
-  if (action === "confirm") {
-    if (flow.stage !== "awaiting_confirmation" || !flow.quote) {
-      await ctx.reply("Нет данных для подтверждения. Начните заново.");
+      await ctx.reply(
+        `Enter how much ${flow.selectedToken.symbol} you want to swap (available ${availableAmount}, ${availableValue}). You can type a number or MAX.`
+      );
       return;
     }
-    try {
-      await ctx.reply("Выполняю обмен, пожалуйста подождите...");
-      const sig = await executeSwapQuote(flow.quote);
-      await ctx.reply(
-        `Сделка выполнена!\nСсылка: https://solscan.io/tx/${sig}`
-      );
+
+    if (action === "confirm") {
+      if (flow.stage !== "awaiting_confirmation" || !flow.quote) {
+        await ctx.reply("No data to confirm. Start over.");
+        return;
+      }
+      try {
+        await ctx.reply("Executing the swap, please wait...");
+        const sig = await executeSwapQuote(flow.quote);
+        await ctx.reply(
+          `Trade executed!\nLink: https://solscan.io/tx/${sig}`
+        );
       const amountUiNumber = Number(flow.amountUi);
       const estimatedValueUsd =
         Number.isFinite(flow.selectedToken?.priceUsdt) &&
@@ -647,25 +649,25 @@ async function handleSellCallback(ctx, data) {
         }),
         refreshWalletState(ctx, "sell:executed"),
       ]);
-    } catch (e) {
-      console.error("Sell execution error", e);
-      await ctx.reply(
-        "Не удалось выполнить сделку. Подождите ~30 секунд и попробуйте снова."
-      );
+      } catch (e) {
+        console.error("Sell execution error", e);
+        await ctx.reply(
+          "Failed to execute the trade. Wait ~30 seconds and try again."
+        );
+        return;
+      } finally {
+        resetSellFlow(ctx);
+      }
       return;
-    } finally {
-      resetSellFlow(ctx);
     }
-    return;
-  }
 
-  if (action === "cancel") {
-    resetSellFlow(ctx);
-    await ctx.reply("Операция продажи отменена.");
-    return;
-  }
+    if (action === "cancel") {
+      resetSellFlow(ctx);
+      await ctx.reply("Sell operation canceled.");
+      return;
+    }
 
-  await ctx.reply("Неизвестное действие. Попробуйте снова начать процесс продажи.");
+  await ctx.reply("Unknown action. Try starting the sell flow again.");
 }
 
 async function handleBuyCallback(ctx, data) {
@@ -673,7 +675,9 @@ async function handleBuyCallback(ctx, data) {
   ctx.session ??= {};
   const flow = ctx.session.buyFlow;
   if (!flow) {
-    await ctx.reply("Сессия покупки не активна. Нажмите Buy, чтобы начать заново.");
+    await ctx.reply(
+      "The buy session is not active. Press Buy to start again."
+    );
     return;
   }
 
@@ -682,42 +686,44 @@ async function handleBuyCallback(ctx, data) {
   const payload = parts.slice(2).join(":");
 
   if (action === "pay") {
-    if (!flow.targetToken) {
-      await ctx.reply("Сначала выберите токен для покупки.");
-      return;
-    }
-    try {
-      await ensureBuyPaymentTokens(flow, ctx);
-    } catch (e) {
-      await ctx.reply("Не удалось загрузить список токенов: " + e.message);
-      return;
-    }
-    const token = flow.paymentTokens?.[payload];
-    if (!token) {
-      await ctx.reply("Не удалось определить токен оплаты. Попробуйте снова.");
-      return;
-    }
+      if (!flow.targetToken) {
+        await ctx.reply("Select a token to buy first.");
+        return;
+      }
+      try {
+        await ensureBuyPaymentTokens(flow, ctx);
+      } catch (e) {
+        await ctx.reply("Failed to load the token list: " + e.message);
+        return;
+      }
+      const token = flow.paymentTokens?.[payload];
+      if (!token) {
+        await ctx.reply(
+          "Failed to resolve the payment token. Please try again."
+        );
+        return;
+      }
     flow.paymentToken = token;
     flow.stage = "awaiting_amount";
     const availableAmount = formatAmount(token.uiAmount);
     const availableValue = formatUsd(token.valueUsdt);
-    await ctx.reply(
-      `Введите количество ${token.symbol} для обмена (доступно ${availableAmount}, ${availableValue}). Вы можете ввести число или MAX.`
-    );
-    return;
-  }
-
-  if (action === "confirm") {
-    if (flow.stage !== "awaiting_confirmation" || !flow.quote) {
-      await ctx.reply("Нет данных для подтверждения. Начните заново.");
+      await ctx.reply(
+        `Enter how much ${token.symbol} you want to swap (available ${availableAmount}, ${availableValue}). You can type a number or MAX.`
+      );
       return;
     }
-    try {
-      await ctx.reply("Выполняю обмен, пожалуйста подождите...");
-      const sig = await executeSwapQuote(flow.quote);
-      await ctx.reply(
-        `Сделка выполнена!\nСсылка: https://solscan.io/tx/${sig}`
-      );
+
+  if (action === "confirm") {
+      if (flow.stage !== "awaiting_confirmation" || !flow.quote) {
+        await ctx.reply("No data to confirm. Start over.");
+        return;
+      }
+      try {
+        await ctx.reply("Executing the swap, please wait...");
+        const sig = await executeSwapQuote(flow.quote);
+        await ctx.reply(
+          `Trade executed!\nLink: https://solscan.io/tx/${sig}`
+        );
       const paymentAmountUi = Number(flow.amountUi);
       const paymentValueUsd =
         Number.isFinite(flow.paymentToken?.priceUsdt) &&
@@ -758,25 +764,25 @@ async function handleBuyCallback(ctx, data) {
         }),
         refreshWalletState(ctx, "buy:executed"),
       ]);
-    } catch (e) {
-      console.error("Buy execution error", e);
-      await ctx.reply(
-        "Не удалось выполнить сделку. Подождите ~30 секунд и попробуйте снова."
-      );
+      } catch (e) {
+        console.error("Buy execution error", e);
+        await ctx.reply(
+          "Failed to execute the trade. Wait ~30 seconds and try again."
+        );
+        return;
+      } finally {
+        resetBuyFlow(ctx);
+      }
       return;
-    } finally {
-      resetBuyFlow(ctx);
     }
-    return;
-  }
 
-  if (action === "cancel") {
-    resetBuyFlow(ctx);
-    await ctx.reply("Операция покупки отменена.");
-    return;
-  }
+    if (action === "cancel") {
+      resetBuyFlow(ctx);
+      await ctx.reply("Buy operation canceled.");
+      return;
+    }
 
-  await ctx.reply("Неизвестное действие. Попробуйте снова начать процесс покупки.");
+  await ctx.reply("Unknown action. Try starting the buy flow again.");
 }
 
 async function processBuyMessage(ctx) {
@@ -786,14 +792,14 @@ async function processBuyMessage(ctx) {
 
   const rawText = ctx.message.text?.trim();
   if (!rawText) {
-    await ctx.reply("Введите текстовое значение.");
+    await ctx.reply("Please enter a text value.");
     return true;
   }
 
   if (flow.stage === "awaiting_symbol") {
     const symbol = rawText.replace(/^\$/, "").trim();
     if (!symbol) {
-      await ctx.reply("Введите символ токена, например PEPE или $PEPE.");
+      await ctx.reply("Enter a token symbol such as PEPE or $PEPE.");
       return true;
     }
     try {
@@ -808,7 +814,7 @@ async function processBuyMessage(ctx) {
       const keyboard = makeBuyPaymentKeyboard(flow);
       if (!keyboard) {
         await ctx.reply(
-          "Не удалось найти токены в кошельке для оплаты. Пополните баланс и попробуйте снова."
+          "Could not find wallet tokens to pay with. Top up the balance and try again."
         );
         resetBuyFlow(ctx);
         return true;
@@ -819,10 +825,10 @@ async function processBuyMessage(ctx) {
         const value = formatUsd(token.valueUsdt);
         return `${token.symbol}: ${amount} (${value})`;
       });
-      await ctx.reply(`Доступные токены в кошельке:\n${balanceLines.join("\n")}`);
-      await ctx.reply("Выберите токен, которым будете платить:", keyboard);
+      await ctx.reply(`Available wallet tokens:\n${balanceLines.join("\n")}`);
+      await ctx.reply("Choose the token you'll pay with:", keyboard);
     } catch (e) {
-      await ctx.reply("Не удалось получить данные о токене: " + e.message);
+      await ctx.reply("Failed to fetch token data: " + e.message);
     }
     return true;
   }
@@ -842,20 +848,20 @@ async function processBuyMessage(ctx) {
       const normalized = rawText.replace(",", ".");
       const parsed = Number(normalized);
       if (!Number.isFinite(parsed) || parsed <= 0) {
-        await ctx.reply("Введите положительное число или MAX.");
+        await ctx.reply("Enter a positive number or MAX.");
         return true;
       }
       try {
         amountRaw = toRawAmount(parsed, flow.paymentToken.decimals);
       } catch (e) {
-        await ctx.reply("Не удалось обработать количество: " + e.message);
+        await ctx.reply("Failed to process the amount: " + e.message);
         return true;
       }
       amountUi = parsed;
     }
 
     if (BigInt(amountRaw) > BigInt(flow.paymentToken.rawAmount)) {
-      await ctx.reply("Недостаточно токенов на балансе.");
+      await ctx.reply("Not enough tokens in the balance.");
       return true;
     }
 
@@ -879,7 +885,7 @@ async function processBuyMessage(ctx) {
       });
     } catch (e) {
       console.error("Buy quote error", e);
-      await ctx.reply("Не удалось получить котировку: " + e.message);
+      await ctx.reply("Failed to obtain the quote: " + e.message);
     }
     return true;
   }
@@ -901,7 +907,7 @@ async function processSellAmount(ctx) {
 
   const rawText = ctx.message.text.trim();
   if (!rawText) {
-    await ctx.reply("Введите количество токена или MAX.");
+    await ctx.reply("Enter a token amount or MAX.");
     return true;
   }
 
@@ -915,20 +921,20 @@ async function processSellAmount(ctx) {
     const normalized = rawText.replace(",", ".");
     const parsed = Number(normalized);
     if (!Number.isFinite(parsed) || parsed <= 0) {
-      await ctx.reply("Введите положительное число или MAX.");
+      await ctx.reply("Enter a positive number or MAX.");
       return true;
     }
     try {
       amountRaw = toRawAmount(parsed, flow.selectedToken.decimals);
     } catch (e) {
-      await ctx.reply("Не удалось обработать количество: " + e.message);
+      await ctx.reply("Failed to process the amount: " + e.message);
       return true;
     }
     amountUi = parsed;
   }
 
   if (BigInt(amountRaw) > BigInt(flow.selectedToken.rawAmount)) {
-    await ctx.reply("Недостаточно токенов на балансе.");
+    await ctx.reply("Not enough tokens in the balance.");
     return true;
   }
 
@@ -954,19 +960,19 @@ async function processSellAmount(ctx) {
       : null;
 
     const lines = [
-      "Предпросмотр сделки",
-      `Отправляете: ${formatAmount(amountUi)} ${flow.selectedToken.symbol}`,
-      `Получите ≈ ${formatAmount(outAmount)} ${flow.target.symbol}`,
+      "Trade preview",
+      `You send: ${formatAmount(amountUi)} ${flow.selectedToken.symbol}`,
+      `You receive ≈ ${formatAmount(outAmount)} ${flow.target.symbol}`,
     ];
     if (Number.isFinite(minOut)) {
       lines.push(
-        `Мин. получение: ${formatAmount(minOut)} ${flow.target.symbol}`
+        `Minimum receive: ${formatAmount(minOut)} ${flow.target.symbol}`
       );
     }
     if (Number.isFinite(priceImpact)) {
-      lines.push(`Просадка: ${priceImpact.toFixed(2)}%`);
+      lines.push(`Price impact: ${priceImpact.toFixed(2)}%`);
     }
-    lines.push("Подтвердите, чтобы выполнить обмен.");
+    lines.push("Confirm to execute the swap.");
 
     await ctx.reply(lines.join("\n"), {
       reply_markup: Markup.inlineKeyboard([
@@ -976,7 +982,7 @@ async function processSellAmount(ctx) {
     });
   } catch (e) {
     console.error("Quote error", e);
-    await ctx.reply("Не удалось получить котировку: " + e.message);
+    await ctx.reply("Failed to obtain the quote: " + e.message);
   }
 
   return true;
@@ -991,14 +997,14 @@ function hasSettings(settings) {
 async function replyWithSettings(ctx) {
   const s = await store.getAll();
   await ctx.reply(
-    "⚙️ Настройте трейд-бота: выберите параметр ниже.",
+    "⚙️ Configure the trade bot: choose a setting below.",
     makeKeyboard(s)
   );
 }
 
 const NUMERIC_EDIT_FIELDS = {
   amount: {
-    title: "Сумма сделки",
+    title: "Trade amount",
     toDisplay: (value) => String(value ?? 0),
     async persist(raw, ctx) {
       const n = Number(raw || 0);
@@ -1008,7 +1014,7 @@ const NUMERIC_EDIT_FIELDS = {
     },
   },
   profitTargetPercent: {
-    title: "Цель по прибыли (%)",
+    title: "Profit target (%)",
     toDisplay: (value) => String(value ?? 0),
     async persist(raw, ctx) {
       const n = Number(raw || 0);
@@ -1052,7 +1058,7 @@ function makeNumericKeyboard() {
 function numericPromptText(field, value) {
   const info = NUMERIC_EDIT_FIELDS[field];
   const visible = value === "" ? "0" : value;
-  return `*${info.title}*\nТекущее значение: \`${visible}\`\nИспользуйте кнопки ниже.`;
+  return `*${info.title}*\nCurrent value: \`${visible}\`\nUse the buttons below.`;
 }
 
 async function beginNumericEdit(ctx, field) {
@@ -1083,11 +1089,11 @@ async function handleNumericCallback(ctx, action) {
   if (!edit) return;
   const message = ctx.callbackQuery.message;
   if (!message || message.message_id !== edit.messageId) return;
-  if (action === "cancel") {
-    ctx.session.numericEdit = null;
-    await ctx.editMessageText("Отменено").catch(() => {});
-    return;
-  }
+    if (action === "cancel") {
+      ctx.session.numericEdit = null;
+      await ctx.editMessageText("Cancelled").catch(() => {});
+      return;
+    }
   if (action === "clear") {
     edit.buffer = "";
   } else if (action === "back") {
@@ -1101,9 +1107,9 @@ async function handleNumericCallback(ctx, action) {
       const info = NUMERIC_EDIT_FIELDS[edit.field];
       const persisted = await info.persist(edit.buffer, ctx);
       ctx.session.numericEdit = null;
-      await ctx.editMessageText(`Сохранено: ${info.title} = ${persisted}`, {
-        parse_mode: "Markdown",
-      });
+        await ctx.editMessageText(`Saved: ${info.title} = ${persisted}`, {
+          parse_mode: "Markdown",
+        });
       await replyWithSettings(ctx);
     } catch (e) {
       await ctx.reply("Error: " + e.message).catch(() => {});
@@ -1124,12 +1130,12 @@ async function handleNumericCallback(ctx, action) {
 }
 
 bot.start(async (ctx) => {
-  await ctx.reply(
-    "Привет! Используй меню для управления сделками. Нажми *Trade-Bot*, чтобы настроить валюту, цель по прибыли и сумму сделки.",
-    {
-      parse_mode: "Markdown",
-      ...makeMainMenuKeyboard(),
-    }
+    await ctx.reply(
+      "Hello! Use the menu to manage trades. Tap *Trade-Bot* to configure the currency, profit target, and trade amount.",
+      {
+        parse_mode: "Markdown",
+        ...makeMainMenuKeyboard(),
+      }
   );
   await replyWithSettings(ctx);
 });
@@ -1154,10 +1160,10 @@ bot.hears("Statistics", async (ctx) => {
       reason: "statistics",
       user: getUserContext(ctx),
     });
-    if (!tokensRaw.length) {
-      await ctx.reply("В кошельке нет токенов для отображения статистики.");
-      return;
-    }
+      if (!tokensRaw.length) {
+        await ctx.reply("There are no wallet tokens to display statistics.");
+        return;
+      }
 
     const tokens = tokensRaw.map((token) => {
       const uiAmount = Number(token.uiAmount);
@@ -1177,12 +1183,12 @@ bot.hears("Statistics", async (ctx) => {
       Number.isFinite(token.valueUsdt)
     );
 
-    if (!valuedTokens.length) {
-      await ctx.reply(
-        "Не удалось определить стоимость токенов. Попробуйте позже."
-      );
-      return;
-    }
+      if (!valuedTokens.length) {
+        await ctx.reply(
+          "Failed to determine token values. Try again later."
+        );
+        return;
+      }
 
     const totalValue = valuedTokens.reduce(
       (sum, token) => sum + Number(token.valueUsdt),
@@ -1204,10 +1210,10 @@ bot.hears("Statistics", async (ctx) => {
     const prevDayEntry = stats.entries.find((entry) => entry.date === yesterdayKey);
     const prevWeekEntry = stats.entries.find((entry) => entry.date === weekKey);
 
-    const lines = [
-      `📊 Статистика кошелька (${formatDateHuman(todayKey)})`,
-      `Текущий баланс: ${formatUsdDetailed(totalValue)}`,
-    ];
+      const lines = [
+        `📊 Wallet stats (${formatDateHuman(todayKey)})`,
+        `Current balance: ${formatUsdDetailed(totalValue)}`,
+      ];
 
     try {
       const tradingSummary = await getTradingSummary();
@@ -1227,7 +1233,7 @@ bot.hears("Statistics", async (ctx) => {
     }
 
     const dayLine = formatChangeLine({
-      label: "Изменение за 24ч",
+      label: "Change over 24h",
       currentValue: totalValue,
       referenceEntry: prevDayEntry,
     });
@@ -1236,7 +1242,7 @@ bot.hears("Statistics", async (ctx) => {
     }
 
     const weekLine = formatChangeLine({
-      label: "Изменение за 7д",
+      label: "Change over 7d",
       currentValue: totalValue,
       referenceEntry: prevWeekEntry,
     });
@@ -1251,7 +1257,7 @@ bot.hears("Statistics", async (ctx) => {
     });
 
     if (tokensSorted.length) {
-      lines.push("", "Токены:");
+      lines.push("", "Tokens:");
       for (const token of tokensSorted) {
         const amountText = Number.isFinite(token.uiAmount)
           ? formatAmount(token.uiAmount)
@@ -1266,7 +1272,7 @@ bot.hears("Statistics", async (ctx) => {
     await ctx.reply(lines.join("\n"));
   } catch (e) {
     console.error("Statistics error", e);
-    await ctx.reply("Не удалось получить статистику: " + e.message);
+    await ctx.reply("Failed to fetch statistics: " + e.message);
   }
 });
 
@@ -1274,6 +1280,13 @@ bot.hears("Trade-Bot", async (ctx) => {
   await ctx.reply(
     "🧠 Trading bot controls:",
     makeTradingMenuKeyboard(tradingEngine.isRunning())
+  );
+});
+
+bot.hears("Back", async (ctx) => {
+  await ctx.reply(
+    "Select an action:",
+    makeMainMenuKeyboard()
   );
 });
 
@@ -1287,7 +1300,7 @@ bot.hears("Start trading", async (ctx) => {
     const result = await tradingEngine.start({ notifyChatId: chatId });
     if (result?.alreadyRunning) {
       await ctx.reply(
-        "Trading engine уже запущен.",
+        "Trading engine is already running.",
         makeTradingMenuKeyboard(tradingEngine.isRunning())
       );
     } else {
@@ -1299,7 +1312,7 @@ bot.hears("Start trading", async (ctx) => {
   } catch (err) {
     console.error("Start trading error", err);
     await ctx.reply(
-      "Не удалось запустить трейдинг: " + err.message,
+      "Failed to start trading: " + err.message,
       makeTradingMenuKeyboard(tradingEngine.isRunning())
     );
   }
@@ -1309,7 +1322,7 @@ bot.hears("Stop trading", async (ctx) => {
   try {
     if (!tradingEngine.isRunning()) {
       await ctx.reply(
-        "Trading engine уже остановлен.",
+        "Trading engine is already stopped.",
         makeTradingMenuKeyboard(false)
       );
       return;
@@ -1322,7 +1335,7 @@ bot.hears("Stop trading", async (ctx) => {
   } catch (err) {
     console.error("Stop trading error", err);
     await ctx.reply(
-      "Не удалось остановить трейдинг: " + err.message,
+      "Failed to stop trading: " + err.message,
       makeTradingMenuKeyboard(tradingEngine.isRunning())
     );
   }
@@ -1377,7 +1390,7 @@ bot.command("set", async (ctx) => {
     await ctx.reply("Saved ✅");
     await replyWithSettings(ctx);
   } catch (e) {
-    await ctx.reply("Ошибка: " + e.message);
+    await ctx.reply("Error: " + e.message);
   }
 });
 
