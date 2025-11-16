@@ -429,7 +429,15 @@ export async function swapOneSolToCoinLiteral(
     };
   } catch (error) {
     console.log("ERROR", error);
-    return { status: "error", text: "Error: " + error.message };
+    const message = error?.message || String(error);
+    return {
+      status: "error",
+      text: "Error: " + message,
+      errorCode: error?.code || null,
+      errorName: error?.name || null,
+      errorMessage: message,
+      httpStatus: error?.response?.status ?? null,
+    };
   }
 }
 

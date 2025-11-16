@@ -24,6 +24,44 @@ const monitorIntervalMs =
   Number(process.env.TRADING_MONITOR_INTERVAL_MS) || 60_000;
 
 const DEFAULT_PHANTOM_SWAP_FEE_PERCENT = 0.85;
+const MAX_SWAP_TIMEOUT_RETRIES = 3;
+const TIMEOUT_ERROR_CODES = new Set([
+  "ETIMEDOUT",
+  "ESOCKETTIMEDOUT",
+  "ETIME",
+  "ECONNABORTED",
+  "REQUEST_TIMEOUT",
+]);
+
+function looksLikeTimeoutText(value) {
+  if (!value) return false;
+  const normalized = String(value).toLowerCase();
+  return (
+    normalized.includes("timeout") ||
+    normalized.includes("timed out") ||
+    normalized.includes("took too long") ||
+    normalized.includes("time-out")
+  );
+}
+
+function swapResultIndicatesTimeout(result) {
+  if (!result || typeof result !== "object") return false;
+  const code = String(result.errorCode || result.code || "").toUpperCase();
+  if (code && TIMEOUT_ERROR_CODES.has(code)) {
+    return true;
+  }
+  const httpStatus = Number(result.httpStatus);
+  if (httpStatus === 408 || httpStatus === 504) {
+    return true;
+  }
+  if (looksLikeTimeoutText(result.errorMessage)) {
+    return true;
+  }
+  if (looksLikeTimeoutText(result.text)) {
+    return true;
+  }
+  return false;
+}
 
 function resolvePhantomSwapFeePercent(settings) {
   const configured = Number(settings?.phantomSwapFeePercent);
@@ -303,6 +341,49 @@ export function createTradingEngine({ store, notifier, logger } = {}) {
     }
   }
 
+  async function executeSwapWithTimeoutRetries({
+    ticker,
+    amount,
+    token,
+    marketCapMinimum,
+  }) {
+    let result = null;
+    for (let attempt = 1; attempt <= MAX_SWAP_TIMEOUT_RETRIES; attempt += 1) {
+      result = await swapOneSolToCoinLiteral(
+        ticker,
+        amount,
+        token,
+        marketCapMinimum
+      );
+      if (!result) {
+        result = {
+          status: "error",
+          text: `Swap failed for ${ticker}`,
+        };
+      }
+      if (result.status === "success" || result.status === "skipped") {
+        return { result, attempts: attempt, exhaustedTimeoutRetries: false };
+      }
+      const timedOut = swapResultIndicatesTimeout(result);
+      if (!timedOut) {
+        return { result, attempts: attempt, exhaustedTimeoutRetries: false };
+      }
+      if (attempt === MAX_SWAP_TIMEOUT_RETRIES) {
+        return { result, attempts: attempt, exhaustedTimeoutRetries: true };
+      }
+      log.warn?.(
+        `Swap attempt ${attempt} for ${ticker} timed out. Retrying attempt ${
+          attempt + 1
+        }...`
+      );
+    }
+    return {
+      result: result || { status: "error", text: `Swap failed for ${ticker}` },
+      attempts: MAX_SWAP_TIMEOUT_RETRIES,
+      exhaustedTimeoutRetries: false,
+    };
+  }
+
   async function handleBuySuccess({
     ticker,
     swapResult,
@@ -533,13 +614,23 @@ export function createTradingEngine({ store, notifier, logger } = {}) {
         );
         return;
       }
-      const swapResult = await swapOneSolToCoinLiteral(
+      const swapAttempt = await executeSwapWithTimeoutRetries({
         ticker,
         amount,
         token,
-        settings?.marketCapMinimum
-      );
+        marketCapMinimum: settings?.marketCapMinimum,
+      });
+      const swapResult = swapAttempt.result || {
+        status: "error",
+        text: `Swap failed for ${ticker}`,
+      };
       if (swapResult.status !== "success") {
+        if (swapAttempt.exhaustedTimeoutRetries) {
+          await notifyAll(
+            `Не удалось приобрести ${ticker}: таймаут транзакции после ${swapAttempt.attempts} попыток.`
+          );
+          return;
+        }
         const message =
           swapResult.text || `Swap ${swapResult.status} for ${ticker}`;
         await notifyAll(message);
